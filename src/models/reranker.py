@@ -1,8 +1,10 @@
 """
 Neural Reranker with Learnable Importance Weights for RM3 + Semantic Similarity
 
-Key contribution: Learn optimal α (RM3) and β (semantic) weights end-to-end
-within a neural reranking framework.
+Architecture:
+1. Learn α (RM3) and β (semantic) weights for expansion terms
+2. Combine query + weighted term embeddings via linear layer → enhanced query embedding
+3. Score enhanced query + document embeddings via linear layer → final score
 """
 
 import logging
@@ -17,13 +19,12 @@ logger = logging.getLogger(__name__)
 
 class ImportanceWeightedNeuralReranker(nn.Module):
     """
-    Neural reranker that learns to combine RM3 and semantic similarity.
+    Neural reranker that learns importance weights and combines query+terms+document.
 
     Architecture:
     1. Learnable weights: α (RM3), β (semantic similarity)
-    2. Weighted term embedding aggregation
-    3. Query + term representation concatenation
-    4. Neural scoring layers
+    2. Linear combination: [query, weighted_terms] → enhanced_query
+    3. Scoring: [enhanced_query, document] → score
     """
 
     def __init__(self,
@@ -33,7 +34,7 @@ class ImportanceWeightedNeuralReranker(nn.Module):
                  dropout: float = 0.1,
                  device: str = None):
         """
-        Initialize neural reranker with learnable importance weights.
+        Initialize neural reranker.
 
         Args:
             model_name: Sentence transformer model
@@ -55,14 +56,24 @@ class ImportanceWeightedNeuralReranker(nn.Module):
 
         # KEY CONTRIBUTION: Learnable importance weights
         self.alpha = nn.Parameter(torch.tensor(1.0))  # RM3 weight
-        self.beta = nn.Parameter(torch.tensor(1.0))  # Semantic weight
+        self.beta = nn.Parameter(torch.tensor(1.0))   # Semantic weight
 
-        # Neural scoring architecture
-        # Input: [query_embedding + weighted_term_embedding]
-        input_dim = self.embedding_dim * 2
+        # Query enhancement layer: [query + weighted_terms] → enhanced_query
+        # Input: query_emb + max_terms * term_emb = (1 + max_terms) * embedding_dim
+        query_enhancement_input_dim = (1 + max_expansion_terms) * self.embedding_dim
+
+        self.query_enhancement = nn.Sequential(
+            nn.Linear(query_enhancement_input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, self.embedding_dim)  # Output same size as embedding
+        ).to(self.device)
+
+        # Scoring layer: [enhanced_query + document] → score
+        scoring_input_dim = 2 * self.embedding_dim
 
         self.scoring_layers = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(scoring_input_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
@@ -77,15 +88,17 @@ class ImportanceWeightedNeuralReranker(nn.Module):
         logger.info(f"ImportanceWeightedNeuralReranker initialized:")
         logger.info(f"  Model: {model_name}")
         logger.info(f"  Embedding dim: {self.embedding_dim}")
+        logger.info(f"  Max expansion terms: {max_expansion_terms}")
         logger.info(f"  Hidden dim: {hidden_dim}")
         logger.info(f"  Learnable weights: α={self.alpha.item():.3f}, β={self.beta.item():.3f}")
 
     def _init_weights(self):
         """Initialize neural network weights."""
-        for module in self.scoring_layers:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                nn.init.zeros_(module.bias)
+        for module in [self.query_enhancement, self.scoring_layers]:
+            for layer in module:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_uniform_(layer.weight)
+                    nn.init.zeros_(layer.bias)
 
     def encode_text(self, text: str) -> torch.Tensor:
         """Encode text into embedding."""
@@ -125,84 +138,80 @@ class ImportanceWeightedNeuralReranker(nn.Module):
 
         return importance_weights
 
-    def create_weighted_term_representation(self,
-                                            terms: List[str],
-                                            importance_weights: Dict[str, float]) -> torch.Tensor:
+    def create_enhanced_query_embedding(self,
+                                        query: str,
+                                        expansion_features: Dict[str, Dict[str, float]]) -> torch.Tensor:
         """
-        Create importance-weighted aggregation of term embeddings.
-
-        Args:
-            terms: List of expansion terms
-            importance_weights: Computed importance weights
-
-        Returns:
-            Aggregated term representation [embedding_dim]
-        """
-        if not terms:
-            return torch.zeros(self.embedding_dim, device=self.device)
-
-        # Limit to max terms
-        terms = terms[:self.max_expansion_terms]
-
-        # Get term embeddings
-        term_embeddings = self.encode_terms(terms)  # [num_terms, embedding_dim]
-
-        # Get importance weights
-        weights = []
-        for term in terms:
-            weight = importance_weights.get(term, 0.0)
-            weights.append(max(weight, 0.0))  # Ensure non-negative
-
-        if not any(weights):
-            # Fallback to uniform weights
-            weights = [1.0] * len(terms)
-
-        # Normalize weights
-        weight_sum = sum(weights)
-        if weight_sum > 0:
-            weights = [w / weight_sum for w in weights]
-
-        weights_tensor = torch.tensor(weights, device=self.device, dtype=torch.float32)
-        weights_tensor = weights_tensor.unsqueeze(1)  # [num_terms, 1]
-
-        # Weighted aggregation
-        weighted_embeddings = term_embeddings * weights_tensor
-        aggregated_embedding = torch.sum(weighted_embeddings, dim=0)  # [embedding_dim]
-
-        return aggregated_embedding
-
-    def forward(self,
-                query: str,
-                expansion_features: Dict[str, Dict[str, float]]) -> torch.Tensor:
-        """
-        Forward pass: query + expansion features -> relevance score.
+        Create enhanced query embedding via linear combination.
 
         Args:
             query: Query text
             expansion_features: Features for expansion terms
 
         Returns:
-            Relevance score
+            Enhanced query embedding [embedding_dim]
         """
-        # Get query embedding
+        # 1. Get query embedding
         query_embedding = self.encode_text(query)  # [embedding_dim]
 
-        # Compute importance weights using learnable α, β
-        importance_weights = self.compute_importance_weights(expansion_features)
+        # 2. Get expansion terms (limit to max)
+        expansion_terms = list(expansion_features.keys())[:self.max_expansion_terms]
 
-        # Get expansion terms
-        expansion_terms = list(expansion_features.keys())
+        # 3. Prepare input for linear layer
+        embeddings_to_combine = [query_embedding]  # Start with query
 
-        # Create weighted term representation
-        term_embedding = self.create_weighted_term_representation(
-            expansion_terms, importance_weights
-        )  # [embedding_dim]
+        if expansion_terms:
+            # Get term embeddings
+            term_embeddings = self.encode_terms(expansion_terms)  # [num_terms, embedding_dim]
 
-        # Concatenate query and term representations
-        combined_embedding = torch.cat([query_embedding, term_embedding], dim=0)  # [2 * embedding_dim]
+            # Compute importance weights
+            importance_weights = self.compute_importance_weights(expansion_features)
 
-        # Neural scoring
-        score = self.scoring_layers(combined_embedding)  # [1]
+            # Weight the term embeddings
+            for i, term in enumerate(expansion_terms):
+                weight = importance_weights.get(term, 0.0)
+                weighted_embedding = term_embeddings[i] * weight
+                embeddings_to_combine.append(weighted_embedding)
+
+        # 4. Pad to max_expansion_terms if needed
+        while len(embeddings_to_combine) < (1 + self.max_expansion_terms):
+            # Add zero embeddings for missing terms
+            embeddings_to_combine.append(torch.zeros_like(query_embedding))
+
+        # 5. Concatenate all embeddings
+        combined_input = torch.cat(embeddings_to_combine, dim=0)  # [(1+max_terms) * embedding_dim]
+
+        # 6. Pass through linear layer to get enhanced query
+        enhanced_query = self.query_enhancement(combined_input)  # [embedding_dim]
+
+        return enhanced_query
+
+    def forward(self,
+                query: str,
+                expansion_features: Dict[str, Dict[str, float]],
+                document: str) -> torch.Tensor:
+        """
+        Forward pass: query + expansion features + document → relevance score.
+
+        Args:
+            query: Query text
+            expansion_features: Features for expansion terms
+            document: Document text
+
+        Returns:
+            Relevance score
+        """
+        # 1. Create enhanced query embedding
+        enhanced_query_emb = self.create_enhanced_query_embedding(query, expansion_features)
+
+        # 2. Get document embedding
+        document_emb = self.encode_text(document)
+
+        # 3. Combine enhanced query + document
+        combined_emb = torch.cat([enhanced_query_emb, document_emb], dim=0)  # [2 * embedding_dim]
+
+        # 4. Score via neural network
+        score = self.scoring_layers(combined_emb)  # [1]
 
         return score.squeeze()  # scalar
 
@@ -214,14 +223,16 @@ class ImportanceWeightedNeuralReranker(nn.Module):
                           query: str,
                           expansion_features: Dict[str, Dict[str, float]],
                           candidates: List[Tuple[str, float]],
+                          document_texts: Dict[str, str],
                           top_k: int = 100) -> List[Tuple[str, float]]:
         """
-        Rerank candidates using learned neural scoring.
+        Rerank candidates using the neural model.
 
         Args:
             query: Query text
             expansion_features: Expansion term features
             candidates: List of (doc_id, first_stage_score)
+            document_texts: {doc_id: doc_text}
             top_k: Number of results to return
 
         Returns:
@@ -234,109 +245,42 @@ class ImportanceWeightedNeuralReranker(nn.Module):
         results = []
 
         with torch.no_grad():
-            # Score the query expansion (independent of specific documents)
-            neural_score = self.forward(query, expansion_features).item()
-
-            # Apply same score to all candidates (can be enhanced to use doc content)
             for doc_id, first_stage_score in candidates:
-                # Simple approach: use neural score directly
-                # Enhanced approach: combine with first_stage_score
-                final_score = neural_score
-                results.append((doc_id, final_score))
+                if doc_id not in document_texts:
+                    # Fallback to first-stage score if no document text
+                    results.append((doc_id, first_stage_score))
+                    continue
 
-        # Sort by neural score
-        results.sort(key=lambda x: x[1], reverse=True)
-        return results[:top_k]
-
-
-class DocumentAwareReranker(ImportanceWeightedNeuralReranker):
-    """
-    Enhanced version that considers document content in scoring.
-    """
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-        # Enhanced architecture for query-document interaction
-        input_dim = self.embedding_dim * 3  # query + terms + document
-
-        self.scoring_layers = nn.Sequential(
-            nn.Linear(input_dim, self.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(self.hidden_dim // 2, 1)
-        ).to(self.device)
-
-        self._init_weights()
-        logger.info("DocumentAwareReranker initialized")
-
-    def forward(self,
-                query: str,
-                expansion_features: Dict[str, Dict[str, float]],
-                document: str) -> torch.Tensor:
-        """Forward pass with document interaction."""
-        # Get embeddings
-        query_embedding = self.encode_text(query)
-        doc_embedding = self.encode_text(document)
-
-        # Compute importance weights and term representation
-        importance_weights = self.compute_importance_weights(expansion_features)
-        expansion_terms = list(expansion_features.keys())
-        term_embedding = self.create_weighted_term_representation(
-            expansion_terms, importance_weights
-        )
-
-        # Triple concatenation
-        combined_embedding = torch.cat([query_embedding, term_embedding, doc_embedding], dim=0)
-
-        # Neural scoring
-        score = self.scoring_layers(combined_embedding)
-        return score.squeeze()
-
-    def rerank_candidates(self,
-                          query: str,
-                          expansion_features: Dict[str, Dict[str, float]],
-                          candidates: List[Tuple[str, str, float]],  # Include doc_text
-                          top_k: int = 100) -> List[Tuple[str, float]]:
-        """Rerank with document content."""
-        if not candidates:
-            return []
-
-        self.eval()
-        results = []
-
-        with torch.no_grad():
-            for doc_id, doc_text, first_stage_score in candidates:
                 try:
-                    neural_score = self.forward(query, expansion_features, doc_text).item()
+                    # Get neural score
+                    neural_score = self.forward(
+                        query,
+                        expansion_features,
+                        document_texts[doc_id]
+                    ).item()
+
                     results.append((doc_id, neural_score))
+
                 except Exception as e:
-                    logger.warning(f"Error scoring {doc_id}: {e}")
+                    logger.warning(f"Error scoring document {doc_id}: {e}")
                     results.append((doc_id, first_stage_score))
 
+        # Sort by neural score (descending)
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_k]
 
 
 # Factory function
 def create_neural_reranker(model_name: str = 'all-MiniLM-L6-v2',
-                           use_document_content: bool = False,
                            **kwargs) -> ImportanceWeightedNeuralReranker:
     """
     Factory function to create neural reranker.
 
     Args:
         model_name: Sentence transformer model
-        use_document_content: Whether to use document content in scoring
         **kwargs: Additional arguments
 
     Returns:
         Neural reranker instance
     """
-    if use_document_content:
-        return DocumentAwareReranker(model_name=model_name, **kwargs)
-    else:
-        return ImportanceWeightedNeuralReranker(model_name=model_name, **kwargs)
+    return ImportanceWeightedNeuralReranker(model_name=model_name, **kwargs)

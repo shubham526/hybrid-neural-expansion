@@ -1,5 +1,7 @@
 """
 Neural Training Pipeline for Importance-Weighted Reranking
+
+Updated for the new reranker that requires document content.
 """
 
 import logging
@@ -10,134 +12,20 @@ from torch.utils.data import Dataset, DataLoader
 from typing import Dict, List, Tuple, Any
 import numpy as np
 from tqdm import tqdm
+from src.utils.data_utils import DocumentAwareExpansionDataset, PairwiseExpansionDataset
 
 logger = logging.getLogger(__name__)
 
 
-class ExpansionDataset(Dataset):
-    """Dataset for neural reranking training."""
-
-    def __init__(self,
-                 features: Dict[str, Dict[str, Any]],
-                 queries: Dict[str, str],
-                 qrels: Dict[str, Dict[str, int]],
-                 first_stage_runs: Dict[str, List[Tuple[str, float]]],
-                 documents: Dict[str, str] = None,
-                 max_candidates_per_query: int = 100):
-        """
-        Initialize dataset.
-
-        Args:
-            features: Extracted expansion features
-            queries: Query texts
-            qrels: Relevance judgments
-            first_stage_runs: First-stage retrieval results
-            documents: Document collection (optional, for document-aware models)
-            max_candidates_per_query: Limit candidates per query
-        """
-        self.features = features
-        self.queries = queries
-        self.qrels = qrels
-        self.first_stage_runs = first_stage_runs
-        self.documents = documents or {}
-        self.max_candidates = max_candidates_per_query
-
-        # Create training examples
-        self.examples = self._create_training_examples()
-
-        logger.info(f"Created dataset with {len(self.examples)} training examples")
-
-    def _create_training_examples(self) -> List[Dict[str, Any]]:
-        """Create training examples from data."""
-        examples = []
-
-        for query_id in self.features:
-            if (query_id not in self.queries or
-                    query_id not in self.qrels or
-                    query_id not in self.first_stage_runs):
-                continue
-
-            query_text = self.queries[query_id]
-            query_qrels = self.qrels[query_id]
-            candidates = self.first_stage_runs[query_id][:self.max_candidates]
-            expansion_features = self.features[query_id]['term_features']
-
-            # Create one example per query (query-level scoring)
-            # For document-aware models, you'd create one example per (query, doc) pair
-
-            # Aggregate relevance for query-level target
-            relevance_scores = [query_qrels.get(doc_id, 0) for doc_id, _ in candidates]
-            avg_relevance = np.mean(relevance_scores) if relevance_scores else 0.0
-
-            example = {
-                'query_id': query_id,
-                'query_text': query_text,
-                'expansion_features': expansion_features,
-                'target_relevance': float(avg_relevance),
-                'num_candidates': len(candidates)
-            }
-
-            examples.append(example)
-
-        return examples
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, idx):
-        return self.examples[idx]
-
-
-class DocumentAwareDataset(ExpansionDataset):
-    """Dataset for document-aware neural reranking."""
-
-    def _create_training_examples(self) -> List[Dict[str, Any]]:
-        """Create (query, document) pair examples."""
-        examples = []
-
-        for query_id in self.features:
-            if (query_id not in self.queries or
-                    query_id not in self.qrels or
-                    query_id not in self.first_stage_runs):
-                continue
-
-            query_text = self.queries[query_id]
-            query_qrels = self.qrels[query_id]
-            candidates = self.first_stage_runs[query_id][:self.max_candidates]
-            expansion_features = self.features[query_id]['term_features']
-
-            # Create one example per (query, document) pair
-            for doc_id, first_stage_score in candidates:
-                if doc_id not in self.documents:
-                    continue
-
-                doc_text = self.documents[doc_id]
-                relevance = query_qrels.get(doc_id, 0)
-
-                example = {
-                    'query_id': query_id,
-                    'query_text': query_text,
-                    'expansion_features': expansion_features,
-                    'doc_id': doc_id,
-                    'doc_text': doc_text,
-                    'first_stage_score': first_stage_score,
-                    'target_relevance': float(relevance)
-                }
-
-                examples.append(example)
-
-        return examples
-
-
-class NeuralTrainer:
-    """Trainer for neural reranking models."""
+class Trainer:
+    """Trainer for the new document-aware neural reranking models."""
 
     def __init__(self,
                  model: nn.Module,
                  learning_rate: float = 1e-3,
                  weight_decay: float = 1e-4,
-                 batch_size: int = 32,
-                 use_ranking_loss: bool = False):
+                 batch_size: int = 8,  # Smaller batch size due to document content
+                 loss_type: str = "mse"):  # "mse", "ranking", or "bce"
         """
         Initialize trainer.
 
@@ -146,11 +34,11 @@ class NeuralTrainer:
             learning_rate: Learning rate
             weight_decay: Weight decay
             batch_size: Batch size
-            use_ranking_loss: Whether to use ranking loss vs regression loss
+            loss_type: Type of loss function
         """
         self.model = model
         self.batch_size = batch_size
-        self.use_ranking_loss = use_ranking_loss
+        self.loss_type = loss_type
 
         # Optimizer
         self.optimizer = optim.Adam(
@@ -160,18 +48,22 @@ class NeuralTrainer:
         )
 
         # Loss function
-        if use_ranking_loss:
+        if loss_type == "mse":
+            self.criterion = nn.MSELoss()
+        elif loss_type == "bce":
+            self.criterion = nn.BCEWithLogitsLoss()
+        elif loss_type == "ranking":
             self.criterion = nn.MarginRankingLoss(margin=1.0)
         else:
-            self.criterion = nn.MSELoss()
+            raise ValueError(f"Unknown loss type: {loss_type}")
 
         logger.info(f"NeuralTrainer initialized:")
         logger.info(f"  Learning rate: {learning_rate}")
         logger.info(f"  Batch size: {batch_size}")
-        logger.info(f"  Loss type: {'ranking' if use_ranking_loss else 'regression'}")
+        logger.info(f"  Loss type: {loss_type}")
 
-    def train_epoch(self, dataset: Dataset) -> float:
-        """Train for one epoch."""
+    def train_epoch_pointwise(self, dataset: DocumentAwareExpansionDataset) -> float:
+        """Train for one epoch using pointwise loss."""
         self.model.train()
 
         dataloader = DataLoader(dataset, batch_size=1, shuffle=True)  # Batch size 1 for simplicity
@@ -183,27 +75,27 @@ class NeuralTrainer:
 
             try:
                 # Forward pass
-                if hasattr(self.model, 'encode_document') and 'doc_text' in example:
-                    # Document-aware model
-                    predicted_score = self.model.forward(
-                        query=example['query_text'],
-                        expansion_features=example['expansion_features'],
-                        document=example['doc_text']
-                    )
-                else:
-                    # Query-only model
-                    predicted_score = self.model.forward(
-                        query=example['query_text'],
-                        expansion_features=example['expansion_features']
-                    )
-
-                # Target
-                target_score = torch.tensor(
-                    float(example['target_relevance']),
-                    device=self.model.device
+                predicted_score = self.model.forward(
+                    query=example['query_text'],
+                    expansion_features=example['expansion_features'],
+                    document=example['doc_text']
                 )
 
-                # Loss
+                # Target relevance score
+                if self.loss_type == "mse":
+                    # Use relevance as continuous target
+                    target_score = torch.tensor(
+                        float(example['relevance']),
+                        device=self.model.device
+                    )
+                elif self.loss_type == "bce":
+                    # Binary classification (relevant/not relevant)
+                    target_score = torch.tensor(
+                        1.0 if float(example['relevance']) > 0 else 0.0,
+                        device=self.model.device
+                    )
+
+                # Compute loss
                 loss = self.criterion(predicted_score, target_score)
 
                 # Backward pass
@@ -217,6 +109,51 @@ class NeuralTrainer:
 
             except Exception as e:
                 logger.warning(f"Error in training batch: {e}")
+                continue
+
+        return total_loss / num_batches if num_batches > 0 else 0.0
+
+    def train_epoch_pairwise(self, dataset: PairwiseExpansionDataset) -> float:
+        """Train for one epoch using pairwise ranking loss."""
+        self.model.train()
+
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+        total_loss = 0.0
+        num_batches = 0
+
+        for batch in tqdm(dataloader, desc="Pairwise training"):
+            example = {k: v[0] if isinstance(v, list) else v for k, v in batch.items()}
+
+            try:
+                # Score positive document
+                pos_score = self.model.forward(
+                    query=example['query_text'],
+                    expansion_features=example['expansion_features'],
+                    document=example['positive_doc']['doc_text']
+                )
+
+                # Score negative document
+                neg_score = self.model.forward(
+                    query=example['query_text'],
+                    expansion_features=example['expansion_features'],
+                    document=example['negative_doc']['doc_text']
+                )
+
+                # Ranking loss (positive should score higher than negative)
+                target = torch.tensor(1.0, device=self.model.device)  # pos > neg
+                loss = self.criterion(pos_score, neg_score, target)
+
+                # Backward pass
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+                total_loss += loss.item()
+                num_batches += 1
+
+            except Exception as e:
+                logger.warning(f"Error in pairwise training batch: {e}")
                 continue
 
         return total_loss / num_batches if num_batches > 0 else 0.0
@@ -247,7 +184,11 @@ class NeuralTrainer:
             logger.info(f"Epoch {epoch + 1}/{num_epochs}")
 
             # Training
-            train_loss = self.train_epoch(train_dataset)
+            if isinstance(train_dataset, PairwiseExpansionDataset):
+                train_loss = self.train_epoch_pairwise(train_dataset)
+            else:
+                train_loss = self.train_epoch_pointwise(train_dataset)
+
             history['train_loss'].append(train_loss)
 
             # Track learned weights
@@ -282,25 +223,44 @@ class NeuralTrainer:
                 example = {k: v[0] if isinstance(v, list) else v for k, v in batch.items()}
 
                 try:
-                    # Forward pass
-                    if hasattr(self.model, 'encode_document') and 'doc_text' in example:
+                    if isinstance(dataset, PairwiseExpansionDataset):
+                        # Pairwise evaluation
+                        pos_score = self.model.forward(
+                            query=example['query_text'],
+                            expansion_features=example['expansion_features'],
+                            document=example['positive_doc']['doc_text']
+                        )
+
+                        neg_score = self.model.forward(
+                            query=example['query_text'],
+                            expansion_features=example['expansion_features'],
+                            document=example['negative_doc']['doc_text']
+                        )
+
+                        target = torch.tensor(1.0, device=self.model.device)
+                        loss = self.criterion(pos_score, neg_score, target)
+
+                    else:
+                        # Pointwise evaluation
                         predicted_score = self.model.forward(
                             query=example['query_text'],
                             expansion_features=example['expansion_features'],
                             document=example['doc_text']
                         )
-                    else:
-                        predicted_score = self.model.forward(
-                            query=example['query_text'],
-                            expansion_features=example['expansion_features']
-                        )
 
-                    target_score = torch.tensor(
-                        float(example['target_relevance']),
-                        device=self.model.device
-                    )
+                        if self.loss_type == "mse":
+                            target_score = torch.tensor(
+                                float(example['relevance']),
+                                device=self.model.device
+                            )
+                        elif self.loss_type == "bce":
+                            target_score = torch.tensor(
+                                1.0 if float(example['relevance']) > 0 else 0.0,
+                                device=self.model.device
+                            )
 
-                    loss = self.criterion(predicted_score, target_score)
+                        loss = self.criterion(predicted_score, target_score)
+
                     total_loss += loss.item()
                     num_examples += 1
 

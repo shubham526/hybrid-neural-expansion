@@ -2,33 +2,20 @@
 """
 Create Train/Test Data for Neural Reranking
 
-This script creates train.jsonl and test.jsonl files for each fold based on:
-1. Query expansion features (RM3 + semantic similarity)
-2. Relevance judgments from ir_datasets
-3. First-stage runs (from scoreddocs or run file)
-4. Fold definitions from folds.json
-
-Each line in the JSONL files contains:
-{
-    "query_id": "123",
-    "query_text": "machine learning algorithms",
-    "expansion_features": {
-        "neural": {"rm_weight": 0.8, "semantic_score": 0.9},
-        "networks": {"rm_weight": 0.6, "semantic_score": 0.7}
-    },
-    "candidates": [
-        {"doc_id": "doc1", "score": 0.95, "relevance": 2},
-        {"doc_id": "doc2", "score": 0.88, "relevance": 0}
-    ]
-}
+Enhanced version that supports:
+1. Fold-based cross-validation (original functionality)
+2. Single train/test splits (e.g., DL19 train, DL20 test)
+3. Proper DL experimental setup (MS MARCO train + DL val/test)
+4. Simple document loading with generator
 """
 
 import argparse
 import json
 import logging
 import sys
+import random
 from pathlib import Path
-from typing import Dict, List, Any, Set
+from typing import Dict, List, Any, Set, Optional, Tuple
 from collections import defaultdict
 
 # Add project root to path
@@ -72,37 +59,135 @@ def load_jsonl(filepath: Path) -> List[Dict]:
     return data
 
 
+def create_trec_dl_validation_split(queries: Dict[str, str],
+                                    qrels: Dict[str, Dict[str, int]],
+                                    first_stage_runs: Dict[str, List[Tuple[str, float]]],
+                                    val_strategy: str = "random_split",
+                                    val_size: float = 0.2,
+                                    random_seed: int = 42) -> Tuple[Dict, Dict, Dict]:
+    """
+    Create validation split for TREC DL data.
+
+    Args:
+        queries: Query data
+        qrels: Relevance judgments
+        first_stage_runs: First stage runs
+        val_strategy: Validation strategy
+        val_size: Fraction for validation (for random_split)
+        random_seed: Random seed
+
+    Returns:
+        (train_data, val_data, remaining_data) dictionaries
+    """
+    random.seed(random_seed)
+
+    if val_strategy == "random_split":
+        # Random split of current queries
+        all_qids = list(queries.keys())
+        random.shuffle(all_qids)
+
+        val_count = int(len(all_qids) * val_size)
+        val_qids = set(all_qids[:val_count])
+        train_qids = set(all_qids[val_count:])
+
+        logger.info(f"Random split: {len(train_qids)} train, {len(val_qids)} validation")
+
+    elif val_strategy == "first_n":
+        # Use first N queries for validation
+        all_qids = sorted(queries.keys())
+        val_count = max(1, int(len(all_qids) * val_size))
+
+        val_qids = set(all_qids[:val_count])
+        train_qids = set(all_qids[val_count:])
+
+        logger.info(f"First N split: {len(train_qids)} train, {len(val_qids)} validation")
+
+    elif val_strategy == "no_val":
+        # No validation split
+        train_qids = set(queries.keys())
+        val_qids = set()
+
+        logger.info(f"No validation: {len(train_qids)} train queries")
+
+    else:
+        raise ValueError(f"Unknown validation strategy: {val_strategy}")
+
+    # Split data
+    def filter_data(qid_set):
+        return (
+            {qid: queries[qid] for qid in qid_set if qid in queries},
+            {qid: qrels[qid] for qid in qid_set if qid in qrels},
+            {qid: first_stage_runs[qid] for qid in qid_set if qid in first_stage_runs}
+        )
+
+    train_data = filter_data(train_qids)
+    val_data = filter_data(val_qids) if val_qids else ({}, {}, {})
+    remaining_data = (queries, qrels, first_stage_runs)  # Keep all for reference
+
+    return train_data, val_data, remaining_data
+
+
+class DocumentLoader:
+    """Load all documents into memory for fast lookup."""
+
+    def __init__(self, dataset):
+        self.dataset = dataset
+        self.documents = self._load_all_documents()
+        logger.info(f"Loaded {len(self.documents)} documents into memory")
+
+    def _load_all_documents(self) -> Dict[str, str]:
+        """Load all documents into a dictionary."""
+        logger.info("Loading all documents into memory...")
+        documents = {}
+
+        doc_count = 0
+        for doc in tqdm(self.dataset.docs_iter(), desc="Loading documents"):
+            # Handle different document field formats
+            if hasattr(doc, 'text'):
+                doc_text = doc.text
+            elif hasattr(doc, 'body'):
+                title = getattr(doc, 'title', '')
+                body = doc.body
+                doc_text = f"{title} {body}".strip() if title else body
+            else:
+                doc_text = str(doc)  # Fallback
+
+            documents[doc.doc_id] = doc_text
+            doc_count += 1
+
+            # Optional: Progress logging for large collections
+            if doc_count % 100000 == 0:
+                logger.info(f"Loaded {doc_count} documents...")
+
+        logger.info(f"Finished loading {len(documents)} documents")
+        return documents
+
+    def get_document(self, doc_id: str) -> Optional[str]:
+        """Get a single document by ID - O(1) lookup!"""
+        return self.documents.get(doc_id)
+
+    def get_documents(self, doc_ids) -> Dict[str, str]:
+        """Get multiple documents - all O(1) lookups!"""
+        return {doc_id: self.documents[doc_id]
+                for doc_id in doc_ids
+                if doc_id in self.documents}
+
 class TrainTestDataCreator:
-    """Creates train/test data for neural reranking experiments."""
+    """Enhanced data creator supporting both fold-based and single splits with document loading."""
 
     def __init__(self,
                  max_candidates_per_query: int = 100,
                  ensure_positive_examples: bool = True):
-        """
-        Initialize data creator.
-
-        Args:
-            max_candidates_per_query: Maximum candidates to include per query
-            ensure_positive_examples: Whether to ensure training queries have positive examples
-        """
+        """Initialize data creator."""
         self.max_candidates_per_query = max_candidates_per_query
         self.ensure_positive_examples = ensure_positive_examples
 
-        logger.info(f"TrainTestDataCreator initialized:")
+        logger.info(f"EnhancedTrainTestDataCreator initialized:")
         logger.info(f"  Max candidates per query: {max_candidates_per_query}")
         logger.info(f"  Ensure positive examples: {ensure_positive_examples}")
 
     def load_dataset_components(self, dataset_name: str, run_file_path: str = None) -> Dict[str, Any]:
-        """
-        Load all components from ir_datasets.
-
-        Args:
-            dataset_name: IR dataset name
-            run_file_path: Optional path to run file (if not using scoreddocs)
-
-        Returns:
-            Dictionary with all loaded components
-        """
+        """Load all components from ir_datasets with simple document loading."""
         logger.info(f"Loading dataset components: {dataset_name}")
 
         dataset = ir_datasets.load(dataset_name)
@@ -141,59 +226,71 @@ class TrainTestDataCreator:
 
         logger.info(f"Loaded first-stage runs for {len(first_stage_runs)} queries")
 
-        # Load documents (if needed - for large collections, might want to load on-demand)
-        documents = {}
-        try:
-            doc_count = 0
-            for doc in tqdm(dataset.docs_iter(), desc="Loading documents"):
-                doc_text = doc.text if hasattr(doc, 'text') else doc.body
-                documents[doc.doc_id] = doc_text
-                doc_count += 1
-
-                # For very large collections, you might want to limit this
-                # or implement on-demand loading
-                if doc_count > 1000000:  # 1M document limit
-                    logger.warning(f"Stopping document loading at {doc_count} documents")
-                    break
-
-            logger.info(f"Loaded {len(documents)} documents")
-
-        except Exception as e:
-            logger.warning(f"Could not load full document collection: {e}")
-            logger.info("Will load documents on-demand during processing")
-            documents = None
+        # Create simple document loader
+        logger.info("Setting up simple document loader...")
+        document_loader = DocumentLoader(dataset)
 
         return {
             'queries': dict(queries),
             'qrels': dict(qrels),
             'first_stage_runs': dict(first_stage_runs),
-            'documents': documents,
+            'documents': document_loader.documents,  # Use the documents dict directly
             'dataset': dataset
         }
+
+    def load_ms_marco_validation_data(self) -> Dict[str, Any]:
+        """Load MS MARCO dev set for validation."""
+        logger.info("Loading MS MARCO dev set for validation")
+
+        try:
+            # Load MS MARCO passage dev set
+            ms_marco_dev = ir_datasets.load("msmarco-passage/dev")
+
+            # Take a subset for validation (e.g., first 1000 queries)
+            val_queries = {}
+            val_qrels = defaultdict(dict)
+            val_runs = defaultdict(list)
+
+            query_count = 0
+            for query in ms_marco_dev.queries_iter():
+                if query_count >= 1000:  # Limit validation set size
+                    break
+                val_queries[query.query_id] = get_query_text(query)
+                query_count += 1
+
+            # Load corresponding qrels
+            for qrel in ms_marco_dev.qrels_iter():
+                if qrel.query_id in val_queries:
+                    val_qrels[qrel.query_id][qrel.doc_id] = qrel.relevance
+
+            # Load scoreddocs if available
+            if ms_marco_dev.has_scoreddocs():
+                for sdoc in ms_marco_dev.scoreddocs_iter():
+                    if sdoc.query_id in val_queries:
+                        val_runs[sdoc.query_id].append((sdoc.doc_id, sdoc.score))
+
+            logger.info(f"Loaded MS MARCO validation: {len(val_queries)} queries, {len(val_qrels)} qrels")
+
+            return {
+                'queries': dict(val_queries),
+                'qrels': dict(val_qrels),
+                'first_stage_runs': dict(val_runs)
+            }
+
+        except Exception as e:
+            logger.warning(f"Could not load MS MARCO validation data: {e}")
+            return None
 
     def create_training_example(self,
                                 query_id: str,
                                 query_text: str,
                                 expansion_features: Dict[str, Dict[str, float]],
                                 candidates: List[tuple],
-                                qrels: Dict[str, int]) -> Dict[str, Any]:
-        """
-        Create a training example for one query.
+                                qrels: Dict[str, int],
+                                documents: Dict[str, str] = None) -> Dict[str, Any]:
+        """Create a training example for one query WITH document content."""
 
-        Args:
-            query_id: Query identifier
-            query_text: Query text
-            expansion_features: Term features from feature extraction
-            candidates: List of (doc_id, score) tuples from first-stage
-            qrels: Relevance judgments for this query
-
-        Returns:
-            Training example dictionary
-        """
-        # Limit candidates
-        candidates = candidates[:self.max_candidates_per_query]
-
-        # Create candidate list with relevance labels
+        # Create candidate list
         candidate_list = []
         has_positive = False
 
@@ -202,11 +299,21 @@ class TrainTestDataCreator:
             if relevance > 0:
                 has_positive = True
 
-            candidate_list.append({
+            candidate_entry = {
                 'doc_id': doc_id,
                 'score': float(score),
                 'relevance': int(relevance)
-            })
+            }
+
+            # Add document text if available
+            if doc_id in documents:
+                candidate_entry['doc_text'] = documents[doc_id]
+            else:
+                # Skip candidates without document text for training
+                logger.debug(f"Skipping {doc_id} - no document text found")
+                continue
+
+            candidate_list.append(candidate_entry)
 
         # Skip queries without positive examples in training (if required)
         if self.ensure_positive_examples and not has_positive:
@@ -223,24 +330,245 @@ class TrainTestDataCreator:
 
         return example
 
-    def create_fold_data(self,
-                         fold_info: Dict[str, List[str]],
-                         features: Dict[str, Any],
-                         dataset_components: Dict[str, Any]) -> Dict[str, List[Dict]]:
+    def create_proper_dl_experiment_data(self,
+                                         val_year: str,  # "19" or "20"
+                                         test_year: str,  # "20" or "19"
+                                         features_train: Dict[str, Any],
+                                         features_val: Dict[str, Any],
+                                         features_test: Dict[str, Any],
+                                         run_file_path_train: str = None,
+                                         run_file_path_val: str = None,
+                                         run_file_path_test: str = None) -> Dict[str, Any]:
         """
-        Create train/test data for one fold.
+        Create proper TREC DL experimental setup.
 
         Args:
-            fold_info: Dictionary with 'training' and 'testing' query ID lists
-            features: Extracted expansion features
-            dataset_components: Loaded dataset components
+            val_year: DL year for validation ("19" or "20")
+            test_year: DL year for testing ("20" or "19")
+            features_train: Features for MS MARCO train/judged
+            features_val: Features for validation DL year
+            features_test: Features for test DL year
 
         Returns:
-            Dictionary with 'train' and 'test' data lists
+            Dictionary with train/val/test data
         """
+
+        # Dataset names
+        train_dataset = "msmarco-passage/train/judged"
+        val_dataset = f"msmarco-passage/trec-dl-20{val_year}"
+        test_dataset = f"msmarco-passage/trec-dl-20{test_year}"
+
+        logger.info(f"Creating proper DL experiment:")
+        logger.info(f"  Train: {train_dataset}")
+        logger.info(f"  Validation: {val_dataset}")
+        logger.info(f"  Test: {test_dataset}")
+
+        # Load all dataset components
+        train_components = self.load_dataset_components(train_dataset, run_file_path_train)
+        val_components = self.load_dataset_components(val_dataset, run_file_path_val)
+        test_components = self.load_dataset_components(test_dataset, run_file_path_test)
+
+        # Log dataset sizes
+        logger.info(f"Train queries: {len(train_components['queries'])}")
+        logger.info(f"Validation queries: {len(val_components['queries'])}")
+        logger.info(f"Test queries: {len(test_components['queries'])}")
+
+        # Create examples for each split
+        splits = {}
+
+        for split_name, (components, features) in [
+            ('train', (train_components, features_train)),
+            ('val', (val_components, features_val)),
+            ('test', (test_components, features_test))
+        ]:
+            if not components['queries']:
+                logger.warning(f"Empty {split_name} split")
+                splits[split_name] = []
+                continue
+
+            split_data = []
+
+            # Track statistics
+            queries_processed = 0
+            queries_with_features = 0
+            queries_with_runs = 0
+            queries_with_qrels = 0
+
+            for query_id, query_text in tqdm(components['queries'].items(), desc=f"Processing {split_name}"):
+                queries_processed += 1
+
+                # Check if we have all required data
+                has_features = query_id in features
+                has_runs = query_id in components['first_stage_runs']
+                has_qrels = query_id in components['qrels']
+
+                if has_features:
+                    queries_with_features += 1
+                if has_runs:
+                    queries_with_runs += 1
+                if has_qrels:
+                    queries_with_qrels += 1
+
+                if not (has_features and has_runs):
+                    logger.debug(
+                        f"Skipping {split_name} query {query_id} (missing features={not has_features}, runs={not has_runs})")
+                    continue
+
+                expansion_features = features[query_id]['term_features']
+                candidates = components['first_stage_runs'][query_id]
+                query_qrels = components['qrels'].get(query_id, {})
+
+                # For training, optionally filter queries without positive examples
+                # For val/test, keep all queries for proper evaluation
+                ensure_positive = self.ensure_positive_examples and split_name == 'train'
+
+                original_setting = self.ensure_positive_examples
+                self.ensure_positive_examples = ensure_positive
+
+                example = self.create_training_example(
+                    query_id=query_id,
+                    query_text=query_text,
+                    expansion_features=expansion_features,
+                    candidates=candidates,
+                    qrels=query_qrels,
+                    documents=components['documents']
+                )
+
+                self.ensure_positive_examples = original_setting
+
+                if example is not None:
+                    split_data.append(example)
+
+            splits[split_name] = split_data
+
+            # Log detailed statistics
+            logger.info(f"{split_name.title()} split statistics:")
+            logger.info(f"  Total queries: {queries_processed}")
+            logger.info(f"  With features: {queries_with_features}")
+            logger.info(f"  With runs: {queries_with_runs}")
+            logger.info(f"  With qrels: {queries_with_qrels}")
+            logger.info(f"  Final examples: {len(split_data)}")
+
+        return splits
+
+    def create_single_split_data(self,
+                                 train_dataset_name: str,
+                                 test_dataset_name: str,
+                                 features_train: Dict[str, Any],
+                                 features_test: Dict[str, Any],
+                                 val_strategy: str = "random_split",
+                                 run_file_path_train: str = None,
+                                 run_file_path_test: str = None) -> Dict[str, Any]:
+        """
+        Create single train/val/test split (e.g., DL19 train, DL20 test).
+
+        Args:
+            train_dataset_name: Name of training dataset
+            test_dataset_name: Name of test dataset
+            features_train: Extracted features for training data
+            features_test: Extracted features for test data
+            val_strategy: How to create validation set
+            run_file_path_train: Optional run file for training
+            run_file_path_test: Optional run file for testing
+
+        Returns:
+            Dictionary with train/val/test data
+        """
+        logger.info(f"Creating single split: {train_dataset_name} → {test_dataset_name}")
+
+        # Load training dataset
+        train_components = self.load_dataset_components(train_dataset_name, run_file_path_train)
+
+        # Load test dataset
+        test_components = self.load_dataset_components(test_dataset_name, run_file_path_test)
+
+        # Create validation split from training data
+        if val_strategy == "ms_marco":
+            # Use MS MARCO dev set for validation
+            val_components = self.load_ms_marco_validation_data()
+            if val_components is None:
+                # Fallback to random split
+                logger.warning("MS MARCO validation failed, using random split")
+                val_strategy = "random_split"
+
+        if val_strategy != "ms_marco" or val_components is None:
+            # Create validation from training data
+            train_data, val_data, _ = create_trec_dl_validation_split(
+                train_components['queries'],
+                train_components['qrels'],
+                train_components['first_stage_runs'],
+                val_strategy=val_strategy
+            )
+
+            # Update train_components with split data
+            train_components['queries'], train_components['qrels'], train_components['first_stage_runs'] = train_data
+
+            val_components = {
+                'queries': val_data[0],
+                'qrels': val_data[1],
+                'first_stage_runs': val_data[2],
+                'documents': train_components['documents']
+            }
+
+        # Create examples for each split
+        splits = {}
+
+        for split_name, (components, features) in [
+            ('train', (train_components, features_train)),
+            ('val', (val_components, features_train)),  # Use train features for val
+            ('test', (test_components, features_test))
+        ]:
+            if not components['queries']:
+                logger.info(f"Skipping empty {split_name} split")
+                splits[split_name] = []
+                continue
+
+            split_data = []
+
+            for query_id, query_text in tqdm(components['queries'].items(), desc=f"Processing {split_name}"):
+                if (query_id not in features or
+                        query_id not in components['first_stage_runs']):
+                    logger.debug(f"Skipping {split_name} query {query_id} (missing data)")
+                    continue
+
+                expansion_features = features[query_id]['term_features']
+                candidates = components['first_stage_runs'][query_id]
+                query_qrels = components['qrels'].get(query_id, {})
+
+                # For test set, don't filter out queries without positive examples
+                ensure_positive = self.ensure_positive_examples and split_name == 'train'
+
+                # Temporarily override setting
+                original_setting = self.ensure_positive_examples
+                self.ensure_positive_examples = ensure_positive
+
+                example = self.create_training_example(
+                    query_id=query_id,
+                    query_text=query_text,
+                    expansion_features=expansion_features,
+                    candidates=candidates,
+                    qrels=query_qrels,
+                    documents=components['documents']
+                )
+
+                self.ensure_positive_examples = original_setting
+
+                if example is not None:
+                    split_data.append(example)
+
+            splits[split_name] = split_data
+            logger.info(f"Created {len(split_data)} {split_name} examples")
+
+        return splits
+
+    def create_fold_data(self, fold_info: Dict[str, List[str]],
+                         features: Dict[str, Any],
+                         dataset_components: Dict[str, Any]) -> Dict[str, List[Dict]]:
+        """Create train/test data for one fold (original functionality)."""
         queries = dataset_components['queries']
         qrels = dataset_components['qrels']
         first_stage_runs = dataset_components['first_stage_runs']
+        documents = dataset_components['documents']
 
         train_qids = set(fold_info['training'])
         test_qids = set(fold_info['testing'])
@@ -263,7 +591,8 @@ class TrainTestDataCreator:
             query_qrels = qrels.get(query_id, {})
 
             example = self.create_training_example(
-                query_id, query_text, expansion_features, candidates, query_qrels
+                query_id, query_text, expansion_features, candidates, query_qrels,
+                documents=documents
             )
 
             if example is not None:
@@ -284,9 +613,15 @@ class TrainTestDataCreator:
             query_qrels = qrels.get(query_id, {})
 
             # For test, don't filter out queries without positive examples
+            original_setting = self.ensure_positive_examples
+            self.ensure_positive_examples = False
+
             example = self.create_training_example(
-                query_id, query_text, expansion_features, candidates, query_qrels
+                query_id, query_text, expansion_features, candidates, query_qrels,
+                documents=documents
             )
+
+            self.ensure_positive_examples = original_setting
 
             if example is not None:
                 test_data.append(example)
@@ -306,6 +641,10 @@ class TrainTestDataCreator:
         total_queries = len(data)
         total_candidates = sum(len(example['candidates']) for example in data)
         total_positive = sum(example['num_positive'] for example in data)
+        candidates_with_doc_text = sum(
+            sum(1 for c in example['candidates'] if 'doc_text' in c)
+            for example in data
+        )
 
         queries_with_positives = sum(1 for example in data if example['num_positive'] > 0)
 
@@ -321,6 +660,8 @@ class TrainTestDataCreator:
             'num_queries': total_queries,
             'num_candidates': total_candidates,
             'num_positive_examples': total_positive,
+            'candidates_with_doc_text': candidates_with_doc_text,
+            'doc_text_coverage': candidates_with_doc_text / total_candidates if total_candidates > 0 else 0,
             'queries_with_positives': queries_with_positives,
             'avg_candidates_per_query': avg_candidates_per_query,
             'avg_positive_per_query': avg_positive_per_query,
@@ -337,36 +678,86 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    # Input arguments
-    parser.add_argument('--dataset', type=str, required=True,
-                        help='IR dataset name (e.g., disks45/nocr/trec-robust-2004)')
-    parser.add_argument('--features-file', type=str, required=True,
-                        help='Path to extracted features file')
-    parser.add_argument('--folds-file', type=str, required=True,
-                        help='Path to folds.json file with train/test splits')
+    # Mode selection
+    parser.add_argument('--mode', type=str,
+                        choices=['folds', 'single', 'proper_dl'],
+                        default='folds',
+                        help='Data creation mode: folds for cross-validation, single for train/test split, proper_dl for MS MARCO train + DL val/test')
+
+    # Common arguments
     parser.add_argument('--output-dir', type=str, required=True,
                         help='Output directory for train/test files')
-
-    # Optional data source
-    parser.add_argument('--run-file-path', type=str,
-                        help='Path to TREC run file (if not using dataset scoreddocs)')
-
-    # Data creation parameters
     parser.add_argument('--max-candidates-per-query', type=int, default=100,
                         help='Maximum candidates to include per query')
     parser.add_argument('--ensure-positive-training', action='store_true',
                         help='Ensure training queries have positive examples')
 
-    # Processing options
+    # Fold mode arguments
+    parser.add_argument('--dataset', type=str,
+                        help='IR dataset name (for fold mode)')
+    parser.add_argument('--features-file', type=str,
+                        help='Path to extracted features file (for fold mode)')
+    parser.add_argument('--folds-file', type=str,
+                        help='Path to folds.json file (for fold mode)')
+    parser.add_argument('--run-file-path', type=str,
+                        help='Path to TREC run file (if not using dataset scoreddocs)')
     parser.add_argument('--specific-fold', type=str,
                         help='Process only specific fold (e.g., "0")')
+
+    # Single split mode arguments
+    parser.add_argument('--train-dataset', type=str,
+                        help='Training dataset name (for single mode)')
+    parser.add_argument('--test-dataset', type=str,
+                        help='Test dataset name (for single mode)')
+    parser.add_argument('--train-features-file', type=str,
+                        help='Path to training features file (for single mode)')
+    parser.add_argument('--test-features-file', type=str,
+                        help='Path to test features file (for single mode)')
+    parser.add_argument('--val-strategy', type=str, default='random_split',
+                        choices=['random_split', 'first_n', 'ms_marco', 'no_val'],
+                        help='Validation set creation strategy')
+    parser.add_argument('--run-file-train', type=str,
+                        help='Path to training run file (for single mode)')
+    parser.add_argument('--run-file-test', type=str,
+                        help='Path to test run file (for single mode)')
+
+    # Proper DL mode arguments
+    parser.add_argument('--val-year', type=str, choices=['19', '20'],
+                        help='DL year for validation (proper_dl mode)')
+    parser.add_argument('--test-year', type=str, choices=['19', '20'],
+                        help='DL year for testing (proper_dl mode)')
+    parser.add_argument('--val-features-file', type=str,
+                        help='Path to validation DL features (proper_dl mode)')
+
+    # Other arguments
     parser.add_argument('--save-statistics', action='store_true',
                         help='Save data statistics')
-
     parser.add_argument('--log-level', type=str, default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
 
     args = parser.parse_args()
+
+    # Validate arguments based on mode
+    if args.mode == 'folds':
+        required_fold_args = ['dataset', 'features_file', 'folds_file']
+        missing = [arg for arg in required_fold_args if not getattr(args, arg)]
+        if missing:
+            parser.error(f"Fold mode requires: {', '.join(missing)}")
+
+    elif args.mode == 'single':
+        required_single_args = ['train_dataset', 'test_dataset', 'train_features_file', 'test_features_file']
+        missing = [arg for arg in required_single_args if not getattr(args, arg)]
+        if missing:
+            parser.error(f"Single mode requires: {', '.join(missing)}")
+
+    elif args.mode == 'proper_dl':
+        required_dl_args = ['val_year', 'test_year', 'train_features_file', 'val_features_file', 'test_features_file']
+        missing = [arg for arg in required_dl_args if not getattr(args, arg)]
+        if missing:
+            parser.error(f"Proper DL mode requires: {', '.join(missing)}")
+
+        if args.val_year == args.test_year:
+            parser.error("Validation and test years must be different")
 
     # Setup logging
     output_dir = ensure_dir(args.output_dir)
@@ -375,106 +766,266 @@ def main():
     log_experiment_info(logger, **vars(args))
 
     try:
-        # Load folds definition
-        with TimedOperation(logger, "Loading fold definitions"):
-            folds = load_json(args.folds_file)
-            logger.info(f"Loaded {len(folds)} folds")
-
-            if args.specific_fold:
-                if args.specific_fold not in folds:
-                    raise ValueError(f"Fold '{args.specific_fold}' not found in folds file")
-                folds = {args.specific_fold: folds[args.specific_fold]}
-                logger.info(f"Processing only fold {args.specific_fold}")
-
-        # Load features
-        with TimedOperation(logger, "Loading extracted features"):
-            features = load_json(args.features_file)
-            logger.info(f"Loaded features for {len(features)} queries")
-
-        # Load dataset components
-        with TimedOperation(logger, "Loading dataset components"):
-            dataset_components = TrainTestDataCreator().load_dataset_components(
-                args.dataset, args.run_file_path
-            )
-
         # Create data creator
         data_creator = TrainTestDataCreator(
             max_candidates_per_query=args.max_candidates_per_query,
             ensure_positive_examples=args.ensure_positive_training
         )
 
-        # Process each fold
-        for fold_id, fold_info in folds.items():
-            logger.info(f"\n{'=' * 50}")
-            logger.info(f"Processing Fold {fold_id}")
-            logger.info(f"{'=' * 50}")
+        if args.mode == 'folds':
+            # Original fold-based functionality
+            with TimedOperation(logger, "Loading fold definitions"):
+                folds = load_json(args.folds_file)
+                logger.info(f"Loaded {len(folds)} folds")
 
-            # Create fold directory
-            fold_dir = ensure_dir(output_dir / f"fold_{fold_id}")
+                if args.specific_fold:
+                    if args.specific_fold not in folds:
+                        raise ValueError(f"Fold '{args.specific_fold}' not found in folds file")
+                    folds = {args.specific_fold: folds[args.specific_fold]}
+                    logger.info(f"Processing only fold {args.specific_fold}")
 
-            # Log fold info
-            train_qids = fold_info['training']
-            test_qids = fold_info['testing']
-            logger.info(f"Training queries: {len(train_qids)}")
-            logger.info(f"Test queries: {len(test_qids)}")
+            with TimedOperation(logger, "Loading extracted features"):
+                features = load_json(args.features_file)
+                logger.info(f"Loaded features for {len(features)} queries")
 
-            # Create train/test data for this fold
-            with TimedOperation(logger, f"Creating data for fold {fold_id}"):
-                fold_data = data_creator.create_fold_data(
-                    fold_info, features, dataset_components
+            with TimedOperation(logger, "Loading dataset components"):
+                dataset_components = data_creator.load_dataset_components(
+                    args.dataset, args.run_file_path
                 )
 
-            # Save train/test files
-            train_file = fold_dir / 'train.jsonl'
-            test_file = fold_dir / 'test.jsonl'
+            # Process each fold
+            for fold_id, fold_info in folds.items():
+                logger.info(f"\n{'=' * 50}")
+                logger.info(f"Processing Fold {fold_id}")
+                logger.info(f"{'=' * 50}")
 
-            save_jsonl(fold_data['train'], train_file)
-            save_jsonl(fold_data['test'], test_file)
+                fold_dir = ensure_dir(output_dir / f"fold_{fold_id}")
 
-            logger.info(f"Saved training data to: {train_file}")
-            logger.info(f"Saved test data to: {test_file}")
+                train_qids = fold_info['training']
+                test_qids = fold_info['testing']
+                logger.info(f"Training queries: {len(train_qids)}")
+                logger.info(f"Test queries: {len(test_qids)}")
 
-            # Compute and save statistics
+                with TimedOperation(logger, f"Creating data for fold {fold_id}"):
+                    fold_data = data_creator.create_fold_data(
+                        fold_info, features, dataset_components
+                    )
+
+                # Save files
+                train_file = fold_dir / 'train.jsonl'
+                test_file = fold_dir / 'test.jsonl'
+
+                save_jsonl(fold_data['train'], train_file)
+                save_jsonl(fold_data['test'], test_file)
+
+                logger.info(f"Saved training data to: {train_file}")
+                logger.info(f"Saved test data to: {test_file}")
+
+                # Save statistics
+                if args.save_statistics:
+                    train_stats = data_creator.get_data_statistics(fold_data['train'])
+                    test_stats = data_creator.get_data_statistics(fold_data['test'])
+
+                    stats = {
+                        'fold_id': fold_id,
+                        'dataset': args.dataset,
+                        'train_stats': train_stats,
+                        'test_stats': test_stats,
+                        'train_file': str(train_file),
+                        'test_file': str(test_file)
+                    }
+
+                    stats_file = fold_dir / 'data_stats.json'
+                    save_json(stats, stats_file)
+                    logger.info(f"Saved statistics to: {stats_file}")
+
+                    # Log key statistics
+                    logger.info(f"Training data statistics:")
+                    logger.info(f"  Queries: {train_stats['num_queries']}")
+                    logger.info(f"  Candidates: {train_stats['num_candidates']}")
+                    logger.info(
+                        f"  With document text: {train_stats['candidates_with_doc_text']} ({train_stats['doc_text_coverage']:.1%})")
+                    logger.info(f"  Positive examples: {train_stats['num_positive_examples']}")
+                    logger.info(f"  Positive rate: {train_stats['positive_rate']:.3f}")
+
+                    logger.info(f"Test data statistics:")
+                    logger.info(f"  Queries: {test_stats['num_queries']}")
+                    logger.info(f"  Candidates: {test_stats['num_candidates']}")
+                    logger.info(
+                        f"  With document text: {test_stats['candidates_with_doc_text']} ({test_stats['doc_text_coverage']:.1%})")
+                    logger.info(f"  Positive examples: {test_stats['num_positive_examples']}")
+                    logger.info(f"  Positive rate: {test_stats['positive_rate']:.3f}")
+
+        elif args.mode == 'single':
+            # Single split functionality
+            logger.info(f"\n{'=' * 50}")
+            logger.info(f"Creating Single Split")
+            logger.info(f"Train: {args.train_dataset}")
+            logger.info(f"Test: {args.test_dataset}")
+            logger.info(f"Validation strategy: {args.val_strategy}")
+            logger.info(f"{'=' * 50}")
+
+            with TimedOperation(logger, "Loading extracted features"):
+                features_train = load_json(args.train_features_file)
+                features_test = load_json(args.test_features_file)
+                logger.info(f"Loaded train features for {len(features_train)} queries")
+                logger.info(f"Loaded test features for {len(features_test)} queries")
+
+            with TimedOperation(logger, "Creating single split data"):
+                split_data = data_creator.create_single_split_data(
+                    train_dataset_name=args.train_dataset,
+                    test_dataset_name=args.test_dataset,
+                    features_train=features_train,
+                    features_test=features_test,
+                    val_strategy=args.val_strategy,
+                    run_file_path_train=args.run_file_train,
+                    run_file_path_test=args.run_file_test
+                )
+
+            # Save files
+            for split_name, split_examples in split_data.items():
+                if not split_examples:
+                    continue
+
+                split_file = output_dir / f'{split_name}.jsonl'
+                save_jsonl(split_examples, split_file)
+                logger.info(f"Saved {split_name} data to: {split_file}")
+
+            # Save statistics
             if args.save_statistics:
-                train_stats = data_creator.get_data_statistics(fold_data['train'])
-                test_stats = data_creator.get_data_statistics(fold_data['test'])
+                all_stats = {}
+                for split_name, split_examples in split_data.items():
+                    if split_examples:
+                        all_stats[f'{split_name}_stats'] = data_creator.get_data_statistics(split_examples)
 
-                stats = {
-                    'fold_id': fold_id,
-                    'dataset': args.dataset,
-                    'train_stats': train_stats,
-                    'test_stats': test_stats,
-                    'train_file': str(train_file),
-                    'test_file': str(test_file)
+                summary_stats = {
+                    'train_dataset': args.train_dataset,
+                    'test_dataset': args.test_dataset,
+                    'val_strategy': args.val_strategy,
+                    'splits': all_stats,
+                    'files': {split: str(output_dir / f'{split}.jsonl')
+                              for split in split_data.keys() if split_data[split]}
                 }
 
-                stats_file = fold_dir / 'data_stats.json'
-                save_json(stats, stats_file)
+                stats_file = output_dir / 'data_stats.json'
+                save_json(summary_stats, stats_file)
                 logger.info(f"Saved statistics to: {stats_file}")
 
                 # Log key statistics
-                logger.info(f"Training data statistics:")
-                logger.info(f"  Queries: {train_stats['num_queries']}")
-                logger.info(f"  Candidates: {train_stats['num_candidates']}")
-                logger.info(f"  Positive examples: {train_stats['num_positive_examples']}")
-                logger.info(f"  Positive rate: {train_stats['positive_rate']:.3f}")
+                for split_name, stats in all_stats.items():
+                    logger.info(f"{split_name.replace('_stats', '').title()} data statistics:")
+                    logger.info(f"  Queries: {stats['num_queries']}")
+                    logger.info(f"  Candidates: {stats['num_candidates']}")
+                    logger.info(
+                        f"  With document text: {stats['candidates_with_doc_text']} ({stats['doc_text_coverage']:.1%})")
+                    logger.info(f"  Positive examples: {stats['num_positive_examples']}")
+                    logger.info(f"  Positive rate: {stats['positive_rate']:.3f}")
 
-                logger.info(f"Test data statistics:")
-                logger.info(f"  Queries: {test_stats['num_queries']}")
-                logger.info(f"  Candidates: {test_stats['num_candidates']}")
-                logger.info(f"  Positive examples: {test_stats['num_positive_examples']}")
-                logger.info(f"  Positive rate: {test_stats['positive_rate']:.3f}")
+        elif args.mode == 'proper_dl':
+            # Proper DL experimental setup
+            logger.info(f"\n{'=' * 50}")
+            logger.info(f"Creating Proper DL Experimental Setup")
+            logger.info(f"Train: MS MARCO passage/train/judged")
+            logger.info(f"Validation: TREC DL 20{args.val_year}")
+            logger.info(f"Test: TREC DL 20{args.test_year}")
+            logger.info(f"{'=' * 50}")
+
+            with TimedOperation(logger, "Loading extracted features"):
+                features_train = load_json(args.train_features_file)
+                features_val = load_json(args.val_features_file)
+                features_test = load_json(args.test_features_file)
+
+                logger.info(f"Loaded train features for {len(features_train)} queries")
+                logger.info(f"Loaded val features for {len(features_val)} queries")
+                logger.info(f"Loaded test features for {len(features_test)} queries")
+
+            with TimedOperation(logger, "Creating proper DL split data"):
+                split_data = data_creator.create_proper_dl_experiment_data(
+                    val_year=args.val_year,
+                    test_year=args.test_year,
+                    features_train=features_train,
+                    features_val=features_val,
+                    features_test=features_test
+                )
+
+            # Save files
+            for split_name, split_examples in split_data.items():
+                if not split_examples:
+                    continue
+
+                split_file = output_dir / f'{split_name}.jsonl'
+                save_jsonl(split_examples, split_file)
+                logger.info(f"Saved {split_name} data to: {split_file}")
+
+            # Save statistics
+            if args.save_statistics:
+                all_stats = {}
+                for split_name, split_examples in split_data.items():
+                    if split_examples:
+                        all_stats[f'{split_name}_stats'] = data_creator.get_data_statistics(split_examples)
+
+                summary_stats = {
+                    'mode': 'proper_dl',
+                    'train_dataset': 'msmarco-passage/train/judged',
+                    'val_dataset': f'msmarco-passage/trec-dl-20{args.val_year}',
+                    'test_dataset': f'msmarco-passage/trec-dl-20{args.test_year}',
+                    'splits': all_stats,
+                    'files': {split: str(output_dir / f'{split}.jsonl')
+                              for split in split_data.keys() if split_data[split]}
+                }
+
+                stats_file = output_dir / 'data_stats.json'
+                save_json(summary_stats, stats_file)
+                logger.info(f"Saved statistics to: {stats_file}")
+
+                # Log key statistics
+                for split_name, stats in all_stats.items():
+                    split_display = split_name.replace('_stats', '').title()
+                    logger.info(f"{split_display} data statistics:")
+                    logger.info(f"  Queries: {stats['num_queries']}")
+                    logger.info(f"  Candidates: {stats['num_candidates']}")
+                    logger.info(
+                        f"  With document text: {stats['candidates_with_doc_text']} ({stats['doc_text_coverage']:.1%})")
+                    logger.info(f"  Positive examples: {stats['num_positive_examples']}")
+                    logger.info(f"  Positive rate: {stats['positive_rate']:.3f}")
 
         # Create overall summary
-        summary = {
-            'dataset': args.dataset,
-            'features_file': args.features_file,
-            'folds_file': args.folds_file,
-            'num_folds_processed': len(folds),
-            'max_candidates_per_query': args.max_candidates_per_query,
-            'ensure_positive_training': args.ensure_positive_training,
-            'output_directory': str(output_dir)
-        }
+        if args.mode == 'folds':
+            summary = {
+                'mode': 'folds',
+                'dataset': args.dataset,
+                'features_file': args.features_file,
+                'folds_file': args.folds_file,
+                'num_folds_processed': len(folds),
+                'max_candidates_per_query': args.max_candidates_per_query,
+                'ensure_positive_training': args.ensure_positive_training,
+                'output_directory': str(output_dir)
+            }
+        elif args.mode == 'single':
+            summary = {
+                'mode': 'single',
+                'train_dataset': args.train_dataset,
+                'test_dataset': args.test_dataset,
+                'train_features_file': args.train_features_file,
+                'test_features_file': args.test_features_file,
+                'val_strategy': args.val_strategy,
+                'max_candidates_per_query': args.max_candidates_per_query,
+                'ensure_positive_training': args.ensure_positive_training,
+                'output_directory': str(output_dir)
+            }
+        else:  # proper_dl mode
+            summary = {
+                'mode': 'proper_dl',
+                'train_dataset': 'msmarco-passage/train/judged',
+                'val_dataset': f'msmarco-passage/trec-dl-20{args.val_year}',
+                'test_dataset': f'msmarco-passage/trec-dl-20{args.test_year}',
+                'train_features_file': args.train_features_file,
+                'val_features_file': args.val_features_file,
+                'test_features_file': args.test_features_file,
+                'max_candidates_per_query': args.max_candidates_per_query,
+                'ensure_positive_training': args.ensure_positive_training,
+                'output_directory': str(output_dir)
+            }
 
         summary_file = output_dir / 'summary.json'
         save_json(summary, summary_file)
@@ -483,18 +1034,35 @@ def main():
         logger.info("\n" + "=" * 60)
         logger.info("TRAIN/TEST DATA CREATION COMPLETED SUCCESSFULLY!")
         logger.info("=" * 60)
-        logger.info(f"Dataset: {args.dataset}")
-        logger.info(f"Folds processed: {len(folds)}")
-        logger.info(f"Output directory: {output_dir}")
-        logger.info("=" * 60)
-        logger.info("Next steps:")
-        logger.info("1. Train neural models for each fold:")
-        for fold_id in folds.keys():
+
+        if args.mode == 'folds':
+            logger.info(f"Dataset: {args.dataset}")
+            logger.info(f"Folds processed: {len(folds)}")
+            logger.info("Next steps:")
+            logger.info("1. Train neural models for each fold:")
+            for fold_id in folds.keys():
+                logger.info(f"   python scripts/train.py --train-file {output_dir}/fold_{fold_id}/train.jsonl")
+        elif args.mode == 'single':
+            logger.info(f"Train dataset: {args.train_dataset}")
+            logger.info(f"Test dataset: {args.test_dataset}")
+            logger.info("Next steps:")
+            logger.info("1. Train neural model:")
             logger.info(
-                f"   python scripts/2_train_neural_model.py --train-file {output_dir}/fold_{fold_id}/train.jsonl")
-        logger.info("2. Evaluate trained models:")
-        for fold_id in folds.keys():
-            logger.info(f"   python scripts/3_evaluate_model.py --test-file {output_dir}/fold_{fold_id}/test.jsonl")
+                f"   python scripts/train.py --train-file {output_dir}/train.jsonl --val-file {output_dir}/val.jsonl")
+            logger.info("2. Evaluate model:")
+            logger.info(f"   python scripts/evaluate.py --test-file {output_dir}/test.jsonl")
+        else:  # proper_dl mode
+            logger.info(f"Train: MS MARCO passage/train/judged (~532K queries)")
+            logger.info(f"Validation: TREC DL 20{args.val_year}")
+            logger.info(f"Test: TREC DL 20{args.test_year}")
+            logger.info("Next steps:")
+            logger.info("1. Train neural model:")
+            logger.info(
+                f"   python scripts/train.py --train-file {output_dir}/train.jsonl --val-file {output_dir}/val.jsonl")
+            logger.info("2. Evaluate model:")
+            logger.info(f"   python scripts/evaluate.py --test-file {output_dir}/test.jsonl")
+
+        logger.info(f"Output directory: {output_dir}")
         logger.info("=" * 60)
 
     except Exception as e:
