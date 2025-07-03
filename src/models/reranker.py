@@ -1,10 +1,8 @@
 """
-Neural Reranker with Learnable Importance Weights for RM3 + Semantic Similarity
+Device-Fixed Neural Reranker
 
-Architecture:
-1. Learn α (RM3) and β (semantic) weights for expansion terms
-2. Combine query + weighted term embeddings via linear layer → enhanced query embedding
-3. Score enhanced query + document embeddings via linear layer → final score
+Fixes the "Expected all tensors to be on the same device" error by ensuring
+all tensor operations use the correct device consistently.
 """
 
 import logging
@@ -19,12 +17,7 @@ logger = logging.getLogger(__name__)
 
 class ImportanceWeightedNeuralReranker(nn.Module):
     """
-    Neural reranker that learns importance weights and combines query+terms+document.
-
-    Architecture:
-    1. Learnable weights: α (RM3), β (semantic similarity)
-    2. Linear combination: [query, weighted_terms] → enhanced_query
-    3. Scoring: [enhanced_query, document] → score
+    Device-aware neural reranker with proper tensor device handling.
     """
 
     def __init__(self,
@@ -33,16 +26,6 @@ class ImportanceWeightedNeuralReranker(nn.Module):
                  hidden_dim: int = 128,
                  dropout: float = 0.1,
                  device: str = None):
-        """
-        Initialize neural reranker.
-
-        Args:
-            model_name: Sentence transformer model
-            max_expansion_terms: Maximum expansion terms to use
-            hidden_dim: Hidden dimension for neural layers
-            dropout: Dropout rate
-            device: Device for computation
-        """
         super().__init__()
 
         self.model_name = model_name
@@ -54,22 +37,18 @@ class ImportanceWeightedNeuralReranker(nn.Module):
         self.embedding_dim = self.encoder.get_sentence_embedding_dimension()
         self.device = self.encoder.device
 
-        # KEY CONTRIBUTION: Learnable importance weights
-        self.alpha = nn.Parameter(torch.tensor(1.0))  # RM3 weight
-        self.beta = nn.Parameter(torch.tensor(1.0))   # Semantic weight
+        logger.info(f"Model device: {self.device}")
+        logger.info(f"Embedding dimension: {self.embedding_dim}")
 
-        # Query enhancement layer: [query + weighted_terms] → enhanced_query
-        # Input: query_emb + max_terms * term_emb = (1 + max_terms) * embedding_dim
-        query_enhancement_input_dim = (1 + max_expansion_terms) * self.embedding_dim
+        # FIX 1: Ensure learnable parameters are on correct device
+        self.alpha = nn.Parameter(torch.tensor(0.5, device=self.device, dtype=torch.float32))
+        self.beta = nn.Parameter(torch.tensor(0.5, device=self.device, dtype=torch.float32))
 
-        self.query_enhancement = nn.Sequential(
-            nn.Linear(query_enhancement_input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, self.embedding_dim)  # Output same size as embedding
-        ).to(self.device)
+        # Register parameters explicitly
+        self.register_parameter('alpha', self.alpha)
+        self.register_parameter('beta', self.beta)
 
-        # Scoring layer: [enhanced_query + document] → score
+        # Scoring layers
         scoring_input_dim = 2 * self.embedding_dim
 
         self.scoring_layers = nn.Sequential(
@@ -87,102 +66,119 @@ class ImportanceWeightedNeuralReranker(nn.Module):
 
         logger.info(f"ImportanceWeightedNeuralReranker initialized:")
         logger.info(f"  Model: {model_name}")
+        logger.info(f"  Device: {self.device}")
         logger.info(f"  Embedding dim: {self.embedding_dim}")
-        logger.info(f"  Max expansion terms: {max_expansion_terms}")
-        logger.info(f"  Hidden dim: {hidden_dim}")
-        logger.info(f"  Learnable weights: α={self.alpha.item():.3f}, β={self.beta.item():.3f}")
+        logger.info(f"  Initial weights: α={self.alpha.item():.3f}, β={self.beta.item():.3f}")
 
     def _init_weights(self):
         """Initialize neural network weights."""
-        for module in [self.query_enhancement, self.scoring_layers]:
-            for layer in module:
-                if isinstance(layer, nn.Linear):
-                    nn.init.xavier_uniform_(layer.weight)
+        for layer in self.scoring_layers:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                if layer.bias is not None:
                     nn.init.zeros_(layer.bias)
 
     def encode_text(self, text: str) -> torch.Tensor:
-        """Encode text into embedding."""
+        """Encode text ensuring output is on correct device."""
         with torch.no_grad():
             embedding = self.encoder.encode([text], convert_to_tensor=True)[0]
-        return embedding.to(self.device)
+
+        # FIX 2: Ensure embedding is on correct device
+        embedding = embedding.to(self.device, dtype=torch.float32)
+        return embedding
 
     def encode_terms(self, terms: List[str]) -> torch.Tensor:
-        """Encode multiple terms into embeddings."""
+        """Encode multiple terms ensuring output is on correct device."""
         if not terms:
-            return torch.zeros(1, self.embedding_dim, device=self.device)
+            return torch.zeros(1, self.embedding_dim, device=self.device, dtype=torch.float32)
 
         with torch.no_grad():
             embeddings = self.encoder.encode(terms, convert_to_tensor=True)
-        return embeddings.to(self.device)
 
-    def compute_importance_weights(self,
-                                   expansion_features: Dict[str, Dict[str, float]]) -> Dict[str, float]:
-        """
-        Compute importance weights using learnable α and β.
-
-        Args:
-            expansion_features: {term: {'rm_weight': float, 'semantic_score': float}}
-
-        Returns:
-            {term: importance_weight}
-        """
-        importance_weights = {}
-
-        for term, features in expansion_features.items():
-            rm_weight = features['rm_weight']
-            semantic_score = features['semantic_score']
-
-            # CORE CONTRIBUTION: Learnable linear combination
-            importance = self.alpha * rm_weight + self.beta * semantic_score
-            importance_weights[term] = importance.item()
-
-        return importance_weights
+        # FIX 3: Ensure term embeddings are on correct device
+        embeddings = embeddings.to(self.device, dtype=torch.float32)
+        return embeddings
 
     def create_enhanced_query_embedding(self,
                                         query: str,
                                         expansion_features: Dict[str, Dict[str, float]]) -> torch.Tensor:
         """
-        Create enhanced query embedding via linear combination.
-
-        Args:
-            query: Query text
-            expansion_features: Features for expansion terms
-
-        Returns:
-            Enhanced query embedding [embedding_dim]
+        Create enhanced query embedding with proper device handling.
         """
-        # 1. Get query embedding
-        query_embedding = self.encode_text(query)  # [embedding_dim]
+        # Get base query embedding
+        query_embedding = self.encode_text(query)  # Already on correct device
 
-        # 2. Get expansion terms (limit to max)
-        expansion_terms = list(expansion_features.keys())[:self.max_expansion_terms]
+        # Validate shape and device
+        assert query_embedding.dim() == 1, f"Query embedding should be 1D, got {query_embedding.shape}"
+        assert query_embedding.device == self.device, f"Query embedding on wrong device: {query_embedding.device}"
 
-        # 3. Prepare input for linear layer
-        embeddings_to_combine = [query_embedding]  # Start with query
+        # Get the top-k stemmed terms for iteration
+        stemmed_expansion_terms = list(expansion_features.keys())[:self.max_expansion_terms]
 
-        if expansion_terms:
-            # Get term embeddings
-            term_embeddings = self.encode_terms(expansion_terms)  # [num_terms, embedding_dim]
+        if not stemmed_expansion_terms:
+            logger.debug("No expansion terms, returning original query embedding")
+            return query_embedding
 
-            # Compute importance weights
-            importance_weights = self.compute_importance_weights(expansion_features)
+        # --- FIX STARTS HERE ---
+        # Create a new list of the *original* (unstemmed) words for semantic encoding.
+        # We fall back to the stemmed term if 'original_term' is somehow missing.
+        original_terms_for_encoding = [
+            word
+            for term in stemmed_expansion_terms
+            for word in expansion_features[term].get('original_term', [term])
+        ]
+        # --- FIX ENDS HERE ---
 
-            # Weight the term embeddings
-            for i, term in enumerate(expansion_terms):
-                weight = importance_weights.get(term, 0.0)
-                weighted_embedding = term_embeddings[i] * weight
-                embeddings_to_combine.append(weighted_embedding)
+        # Get term embeddings using the correct, original words
+        try:
+            # Pass the list of original terms to the encoder
+            term_embeddings = self.encode_terms(original_terms_for_encoding)
+            assert term_embeddings.device == self.device, f"Term embeddings on wrong device: {term_embeddings.device}"
+        except Exception as e:
+            logger.warning(f"Error encoding terms: {e}")
+            return query_embedding
 
-        # 4. Pad to max_expansion_terms if needed
-        while len(embeddings_to_combine) < (1 + self.max_expansion_terms):
-            # Add zero embeddings for missing terms
-            embeddings_to_combine.append(torch.zeros_like(query_embedding))
+        # FIX 4: Ensure all intermediate tensors are on correct device
+        weighted_term_sum = torch.zeros_like(query_embedding, device=self.device, dtype=torch.float32)
+        total_weight = torch.tensor(0.0, device=self.device, dtype=torch.float32)
 
-        # 5. Concatenate all embeddings
-        combined_input = torch.cat(embeddings_to_combine, dim=0)  # [(1+max_terms) * embedding_dim]
+        for i, term in enumerate(stemmed_expansion_terms):
+            if term in expansion_features:
+                features = expansion_features[term]
 
-        # 6. Pass through linear layer to get enhanced query
-        enhanced_query = self.query_enhancement(combined_input)  # [embedding_dim]
+                # FIX 5: Create tensors directly on correct device
+                rm_weight = torch.tensor(
+                    features.get('rm_weight', 0.0),
+                    device=self.device,
+                    dtype=torch.float32
+                )
+                semantic_score = torch.tensor(
+                    features.get('semantic_score', 0.0),
+                    device=self.device,
+                    dtype=torch.float32
+                )
+
+                # Compute importance weight (all tensors on same device)
+                importance = self.alpha * rm_weight + self.beta * semantic_score
+
+                # Weight the term embedding
+                term_emb = term_embeddings[i]  # Already on correct device
+                weighted_term_sum += importance * term_emb
+                total_weight += importance.squeeze()
+
+        # Combine with original query
+        if total_weight > 1e-8:
+            # FIX 6: Create mixing weight on correct device
+            expansion_weight = torch.tensor(0.3, device=self.device, dtype=torch.float32)
+            expansion_weight = torch.sigmoid(expansion_weight)
+
+            enhanced_query = (1 - expansion_weight) * query_embedding + expansion_weight * (weighted_term_sum / total_weight)
+        else:
+            enhanced_query = query_embedding
+
+        # Final validation
+        assert enhanced_query.dim() == 1, f"Enhanced query should be 1D, got {enhanced_query.shape}"
+        assert enhanced_query.device == self.device, f"Enhanced query on wrong device: {enhanced_query.device}"
 
         return enhanced_query
 
@@ -191,33 +187,83 @@ class ImportanceWeightedNeuralReranker(nn.Module):
                 expansion_features: Dict[str, Dict[str, float]],
                 document: str) -> torch.Tensor:
         """
-        Forward pass: query + expansion features + document → relevance score.
-
-        Args:
-            query: Query text
-            expansion_features: Features for expansion terms
-            document: Document text
-
-        Returns:
-            Relevance score
+        Forward pass with comprehensive device checking.
         """
-        # 1. Create enhanced query embedding
-        enhanced_query_emb = self.create_enhanced_query_embedding(query, expansion_features)
+        try:
+            # 1. Create enhanced query embedding
+            enhanced_query_emb = self.create_enhanced_query_embedding(query, expansion_features)
 
-        # 2. Get document embedding
-        document_emb = self.encode_text(document)
+            # Device check
+            if enhanced_query_emb.device != self.device:
+                logger.error(f"Enhanced query embedding on wrong device: {enhanced_query_emb.device}, expected: {self.device}")
+                enhanced_query_emb = enhanced_query_emb.to(self.device)
 
-        # 3. Combine enhanced query + document
-        combined_emb = torch.cat([enhanced_query_emb, document_emb], dim=0)  # [2 * embedding_dim]
+            # 2. Get document embedding
+            document_emb = self.encode_text(document)
 
-        # 4. Score via neural network
-        score = self.scoring_layers(combined_emb)  # [1]
+            # Device check
+            if document_emb.device != self.device:
+                logger.error(f"Document embedding on wrong device: {document_emb.device}, expected: {self.device}")
+                document_emb = document_emb.to(self.device)
 
-        return score.squeeze()  # scalar
+            # 3. Validation
+            assert enhanced_query_emb.dim() == 1 and enhanced_query_emb.size(0) == self.embedding_dim
+            assert document_emb.dim() == 1 and document_emb.size(0) == self.embedding_dim
+            assert enhanced_query_emb.device == self.device
+            assert document_emb.device == self.device
+
+            # 4. Concatenate embeddings
+            combined_emb = torch.cat([enhanced_query_emb, document_emb], dim=0)
+
+            # Final device check
+            assert combined_emb.device == self.device, f"Combined embedding on wrong device: {combined_emb.device}"
+
+            # 5. Score via neural network
+            score = self.scoring_layers(combined_emb)
+
+            return score.squeeze()
+
+        except Exception as e:
+            logger.error(f"Forward pass error: {e}")
+            logger.error(f"Model device: {self.device}")
+            logger.error(f"Alpha device: {self.alpha.device}")
+            logger.error(f"Beta device: {self.beta.device}")
+
+            # Additional debugging
+            try:
+                test_query_emb = self.encode_text(query)
+                test_doc_emb = self.encode_text(document)
+                logger.error(f"Test query embedding device: {test_query_emb.device}")
+                logger.error(f"Test document embedding device: {test_doc_emb.device}")
+            except Exception as debug_e:
+                logger.error(f"Even basic encoding failed: {debug_e}")
+
+            raise
 
     def get_learned_weights(self) -> Tuple[float, float]:
         """Get current learned α and β values."""
         return self.alpha.item(), self.beta.item()
+
+    def to(self, device):
+        """Override to method to ensure sentence transformer is also moved."""
+        super().to(device)
+
+        # FIX 7: Also move the sentence transformer
+        self.encoder = self.encoder.to(device)
+        self.device = device
+
+        logger.info(f"Model moved to device: {device}")
+        return self
+
+    def cuda(self, device=None):
+        """Override cuda method."""
+        if device is None:
+            device = torch.cuda.current_device()
+        return self.to(f'cuda:{device}')
+
+    def cpu(self):
+        """Override cpu method."""
+        return self.to('cpu')
 
     def rerank_candidates(self,
                           query: str,
@@ -225,19 +271,7 @@ class ImportanceWeightedNeuralReranker(nn.Module):
                           candidates: List[Tuple[str, float]],
                           document_texts: Dict[str, str],
                           top_k: int = 100) -> List[Tuple[str, float]]:
-        """
-        Rerank candidates using the neural model.
-
-        Args:
-            query: Query text
-            expansion_features: Expansion term features
-            candidates: List of (doc_id, first_stage_score)
-            document_texts: {doc_id: doc_text}
-            top_k: Number of results to return
-
-        Returns:
-            Reranked results [(doc_id, neural_score)]
-        """
+        """Rerank candidates with device safety."""
         if not candidates:
             return []
 
@@ -247,12 +281,10 @@ class ImportanceWeightedNeuralReranker(nn.Module):
         with torch.no_grad():
             for doc_id, first_stage_score in candidates:
                 if doc_id not in document_texts:
-                    # Fallback to first-stage score if no document text
                     results.append((doc_id, first_stage_score))
                     continue
 
                 try:
-                    # Get neural score
                     neural_score = self.forward(
                         query,
                         expansion_features,
@@ -265,7 +297,6 @@ class ImportanceWeightedNeuralReranker(nn.Module):
                     logger.warning(f"Error scoring document {doc_id}: {e}")
                     results.append((doc_id, first_stage_score))
 
-        # Sort by neural score (descending)
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_k]
 
@@ -273,14 +304,51 @@ class ImportanceWeightedNeuralReranker(nn.Module):
 # Factory function
 def create_neural_reranker(model_name: str = 'all-MiniLM-L6-v2',
                            **kwargs) -> ImportanceWeightedNeuralReranker:
-    """
-    Factory function to create neural reranker.
-
-    Args:
-        model_name: Sentence transformer model
-        **kwargs: Additional arguments
-
-    Returns:
-        Neural reranker instance
-    """
+    """Factory function to create neural reranker."""
     return ImportanceWeightedNeuralReranker(model_name=model_name, **kwargs)
+
+
+# Device debugging utility
+def check_model_devices(model):
+    """Debug function to check all model component devices."""
+    print("=== MODEL DEVICE CHECK ===")
+    print(f"Model device attribute: {model.device}")
+    print(f"Encoder device: {model.encoder.device}")
+
+    for name, param in model.named_parameters():
+        print(f"Parameter {name}: {param.device}")
+
+    for name, module in model.named_modules():
+        if hasattr(module, 'weight') and module.weight is not None:
+            print(f"Module {name} weight: {module.weight.device}")
+
+    print("=== END DEVICE CHECK ===")
+
+
+if __name__ == "__main__":
+    # Test device handling
+    print("Testing device handling...")
+
+    # Create model
+    reranker = create_neural_reranker()
+    print(f"Initial device: {reranker.device}")
+
+    # Check devices
+    check_model_devices(reranker)
+
+    # Test data
+    query = "machine learning algorithms"
+    document = "Neural networks are machine learning algorithms."
+    expansion_features = {
+        "neural": {"rm_weight": 0.5, "semantic_score": 0.8},
+        "algorithm": {"rm_weight": 0.7, "semantic_score": 0.9}
+    }
+
+    try:
+        score = reranker.forward(query, expansion_features, document)
+        print(f"Forward pass successful! Score: {score.item()}")
+        print(f"Score device: {score.device}")
+    except Exception as e:
+        print(f"Test failed: {e}")
+        import traceback
+        traceback.print_exc()

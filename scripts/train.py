@@ -98,9 +98,9 @@ def main():
     # Training arguments
     parser.add_argument('--num-epochs', type=int, default=20,
                         help='Number of training epochs')
-    parser.add_argument('--learning-rate', type=float, default=1e-3,
+    parser.add_argument('--learning-rate', type=float, default=1e-4,
                         help='Learning rate')
-    parser.add_argument('--weight-decay', type=float, default=1e-4,
+    parser.add_argument('--weight-decay', type=float, default=1e-5,
                         help='Weight decay')
     parser.add_argument('--batch-size', type=int, default=8,
                         help='Batch size')
