@@ -62,12 +62,13 @@ class ExpansionFeatureExtractor:
                 logger.warning(f"No pseudo-relevant docs for query {query_id}")
                 return None
 
-            # Step 1: Get RM3 expansion terms and weights
-            rm_terms = self.rm_expansion.expand_query(
+            # Step 1: Get RM3 expansion terms and weights WITH original mappings
+            rm_terms, original_mappings = self.rm_expansion.expand_query_with_originals(
                 query=query_text,
                 documents=pseudo_relevant_docs,
                 scores=pseudo_relevant_scores,
                 num_expansion_terms=self.max_expansion_terms,
+                num_feedback_docs=self.top_k_pseudo_docs,  # FIXED: Use the configured value!
                 rm_type="rm3"
             )
 
@@ -75,20 +76,25 @@ class ExpansionFeatureExtractor:
                 logger.warning(f"No RM3 terms for query {query_id}")
                 return None
 
-            # Step 2: Extract terms and compute semantic similarities
+            # Step 2: Extract terms and compute semantic similarities using ORIGINAL terms
             expansion_terms = [term for term, _ in rm_terms]
+            original_terms = [original_mappings.get(term, term) for term in expansion_terms]
+
+            # FIXED: Use original terms for semantic similarity, not stemmed terms!
             semantic_scores = self.semantic_similarity.compute_query_expansion_similarities(
-                query_text, expansion_terms
+                query_text, original_terms
             )
 
-            # Step 3: Combine into feature dictionary
+            # Step 3: Combine into feature dictionary (map back to stemmed terms)
             term_features = {}
-            for term, rm_weight in rm_terms:
-                semantic_score = semantic_scores.get(term, 0.0)
+            for i, (stemmed_term, rm_weight) in enumerate(rm_terms):
+                original_term = original_terms[i]
+                semantic_score = semantic_scores.get(original_term, 0.0)
 
-                term_features[term] = {
+                term_features[stemmed_term] = {
                     'rm_weight': float(rm_weight),
-                    'semantic_score': float(semantic_score)
+                    'semantic_score': float(semantic_score),
+                    'original_term': original_term  # Include for debugging/transparency
                 }
 
             query_features = {
@@ -157,7 +163,24 @@ class ExpansionFeatureExtractor:
     def get_feature_statistics(self, all_features: Dict[str, Dict[str, any]]) -> Dict[str, any]:
         """Compute statistics about extracted features."""
         if not all_features:
-            return {}
+            # Return default stats structure when no features are extracted
+            return {
+                'num_queries': 0,
+                'avg_terms_per_query': 0.0,
+                'total_unique_terms': 0,
+                'rm_weight_stats': {
+                    'mean': 0.0,
+                    'std': 0.0,
+                    'min': 0.0,
+                    'max': 0.0
+                },
+                'semantic_score_stats': {
+                    'mean': 0.0,
+                    'std': 0.0,
+                    'min': 0.0,
+                    'max': 0.0
+                }
+            }
 
         num_queries = len(all_features)
         num_terms_per_query = [len(features['term_features']) for features in all_features.values()]
@@ -179,16 +202,16 @@ class ExpansionFeatureExtractor:
                 set(f['term_features'].keys()) for f in all_features.values()
             ])),
             'rm_weight_stats': {
-                'mean': np.mean(all_rm_weights),
-                'std': np.std(all_rm_weights),
-                'min': np.min(all_rm_weights),
-                'max': np.max(all_rm_weights)
+                'mean': np.mean(all_rm_weights) if all_rm_weights else 0.0,
+                'std': np.std(all_rm_weights) if all_rm_weights else 0.0,
+                'min': np.min(all_rm_weights) if all_rm_weights else 0.0,
+                'max': np.max(all_rm_weights) if all_rm_weights else 0.0
             },
             'semantic_score_stats': {
-                'mean': np.mean(all_semantic_scores),
-                'std': np.std(all_semantic_scores),
-                'min': np.min(all_semantic_scores),
-                'max': np.max(all_semantic_scores)
+                'mean': np.mean(all_semantic_scores) if all_semantic_scores else 0.0,
+                'std': np.std(all_semantic_scores) if all_semantic_scores else 0.0,
+                'min': np.min(all_semantic_scores) if all_semantic_scores else 0.0,
+                'max': np.max(all_semantic_scores) if all_semantic_scores else 0.0
             }
         }
 

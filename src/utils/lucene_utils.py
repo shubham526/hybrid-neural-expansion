@@ -38,8 +38,6 @@ def get_lucene_classes():
                 'ConstantScoreQuery': autoclass('org.apache.lucene.search.ConstantScoreQuery'),
                 'DirectoryReader' : autoclass('org.apache.lucene.index.DirectoryReader'),
                 'CharTermAttribute': autoclass('org.apache.lucene.analysis.tokenattributes.CharTermAttribute'),
-                'StringReader': autoclass('java.io.StringReader')  # Added missing StringReader
-
             }
         except Exception as e:
             logger.error(f"Error loading Lucene classes: {e}")
