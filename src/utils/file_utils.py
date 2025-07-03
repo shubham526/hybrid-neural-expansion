@@ -28,6 +28,69 @@ def ensure_dir(path: Union[str, Path]) -> Path:
     return path
 
 
+def load_jsonl(filepath: Union[str, Path]) -> List[Dict]:
+    """Load data from JSONL file (JSON Lines format)."""
+    filepath = Path(filepath)
+    data = []
+
+    # Handle compressed JSONL files
+    if filepath.suffix == '.gz' or str(filepath).endswith('.jsonl.gz'):
+        with gzip.open(filepath, 'rt', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if line:
+                    try:
+                        data.append(json.loads(line))
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Error parsing line {line_num} in {filepath}: {e}")
+    else:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if line:
+                    try:
+                        data.append(json.loads(line))
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Error parsing line {line_num} in {filepath}: {e}")
+
+    logger.debug(f"Loaded {len(data)} records from JSONL: {filepath}")
+    return data
+
+
+def convert_jsonl_to_dict(jsonl_data: List[Dict], key_field: str = 'query_id') -> Dict[str, Dict]:
+    """Convert JSONL data to dictionary format expected by downstream code."""
+    result = {}
+    for item in jsonl_data:
+        if key_field in item:
+            result[item[key_field]] = item
+        else:
+            logger.warning(f"Item missing key field '{key_field}': {item}")
+
+    logger.debug(f"Converted {len(jsonl_data)} JSONL records to dictionary with {len(result)} keys")
+    return result
+
+
+def load_features_file(filepath: Union[str, Path]) -> Dict[str, Dict]:
+    """
+    Smart loader for feature files - handles both JSON and JSONL formats.
+
+    Returns:
+        Dictionary in format {query_id: features_dict}
+    """
+    filepath = Path(filepath)
+
+    # Check file extension to determine format
+    if '.jsonl' in str(filepath):
+        # JSONL format
+        logger.info(f"Loading JSONL features file: {filepath}")
+        jsonl_data = load_jsonl(filepath)
+        return convert_jsonl_to_dict(jsonl_data, key_field='query_id')
+    else:
+        # Regular JSON format
+        logger.info(f"Loading JSON features file: {filepath}")
+        return load_json(filepath)
+
+
 def save_json(data: Any, filepath: Union[str, Path], indent: int = 2,
               compress: bool = False) -> None:
     """

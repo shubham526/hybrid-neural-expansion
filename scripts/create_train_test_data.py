@@ -25,7 +25,7 @@ sys.path.insert(0, str(project_root))
 import ir_datasets
 from tqdm import tqdm
 
-from src.utils.file_utils import load_json, save_json, load_trec_run, ensure_dir
+from src.utils.file_utils import load_json, save_json, load_trec_run, ensure_dir, load_features_file
 from src.utils.logging_utils import setup_experiment_logging, log_experiment_info, TimedOperation
 
 logger = logging.getLogger(__name__)
@@ -139,9 +139,7 @@ class DocumentLoader:
         """Load all documents into a dictionary."""
         logger.info("Loading all documents into memory...")
         documents = {}
-
-        doc_count = 0
-        for doc in tqdm(self.dataset.docs_iter(), desc="Loading documents"):
+        for doc in tqdm(self.dataset.docs_iter(), desc="Loading documents", total=self.dataset.docs_count()):
             # Handle different document field formats
             if hasattr(doc, 'text'):
                 doc_text = doc.text
@@ -153,11 +151,6 @@ class DocumentLoader:
                 doc_text = str(doc)  # Fallback
 
             documents[doc.doc_id] = doc_text
-            doc_count += 1
-
-            # Optional: Progress logging for large collections
-            if doc_count % 100000 == 0:
-                logger.info(f"Loaded {doc_count} documents...")
 
         logger.info(f"Finished loading {len(documents)} documents")
         return documents
@@ -182,7 +175,7 @@ class TrainTestDataCreator:
         self.max_candidates_per_query = max_candidates_per_query
         self.ensure_positive_examples = ensure_positive_examples
 
-        logger.info(f"EnhancedTrainTestDataCreator initialized:")
+        logger.info(f"TrainTestDataCreator initialized:")
         logger.info(f"  Max candidates per query: {max_candidates_per_query}")
         logger.info(f"  Ensure positive examples: {ensure_positive_examples}")
 
@@ -785,7 +778,7 @@ def main():
                     logger.info(f"Processing only fold {args.specific_fold}")
 
             with TimedOperation(logger, "Loading extracted features"):
-                features = load_json(args.features_file)
+                features = load_features_file(args.features_file)
                 logger.info(f"Loaded features for {len(features)} queries")
 
             with TimedOperation(logger, "Loading dataset components"):
@@ -866,8 +859,8 @@ def main():
             logger.info(f"{'=' * 50}")
 
             with TimedOperation(logger, "Loading extracted features"):
-                features_train = load_json(args.train_features_file)
-                features_test = load_json(args.test_features_file)
+                features_train = load_features_file(args.train_features_file)
+                features_test = load_features_file(args.test_features_file)
                 logger.info(f"Loaded train features for {len(features_train)} queries")
                 logger.info(f"Loaded test features for {len(features_test)} queries")
 
@@ -931,9 +924,9 @@ def main():
             logger.info(f"{'=' * 50}")
 
             with TimedOperation(logger, "Loading extracted features"):
-                features_train = load_json(args.train_features_file)
-                features_val = load_json(args.val_features_file)
-                features_test = load_json(args.test_features_file)
+                features_train = load_features_file(args.train_features_file)
+                features_val = load_features_file(args.val_features_file)
+                features_test = load_features_file(args.test_features_file)
 
                 logger.info(f"Loaded train features for {len(features_train)} queries")
                 logger.info(f"Loaded val features for {len(features_val)} queries")
