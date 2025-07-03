@@ -45,7 +45,8 @@ class LuceneRM3Scorer:
             # Open index and setup searcher
             directory = self.FSDirectory.open(self.Path.get(index_path))
             self.reader = self.DirectoryReader.open(directory)
-            self.searcher = self.IndexSearcher(self.reader)
+            reader_context = self.reader.getContext()
+            self.searcher = self.IndexSearcher(reader_context)
             self.searcher.setSimilarity(self.BM25Similarity(k1, b))
 
             # Setup analyzer (same as used for indexing)

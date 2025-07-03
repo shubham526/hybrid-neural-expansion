@@ -115,7 +115,7 @@ def main():
             # Load documents
             logger.info("Loading document collection...")
             documents = {}
-            for doc in tqdm(dataset.docs_iter(), desc="Loading docs"):
+            for doc in tqdm(dataset.docs_iter(), desc="Loading docs", total=dataset.docs_count()):
                 doc_text = doc.text if hasattr(doc, 'text') else doc.body
                 documents[doc.doc_id] = doc_text
             logger.info(f"Loaded {len(documents)} documents")

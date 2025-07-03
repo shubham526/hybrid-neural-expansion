@@ -37,7 +37,8 @@ def get_lucene_classes():
                 'BM25Similarity' : autoclass('org.apache.lucene.search.similarities.BM25Similarity'),
                 'ConstantScoreQuery': autoclass('org.apache.lucene.search.ConstantScoreQuery'),
                 'DirectoryReader' : autoclass('org.apache.lucene.index.DirectoryReader'),
-                'CharTermAttribute': autoclass('org.apache.lucene.analysis.tokenattributes.CharTermAttribute')
+                'CharTermAttribute': autoclass('org.apache.lucene.analysis.tokenattributes.CharTermAttribute'),
+                'StringReader': autoclass('java.io.StringReader')  # Added missing StringReader
 
             }
         except Exception as e:
