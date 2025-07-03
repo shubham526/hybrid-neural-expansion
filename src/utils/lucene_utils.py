@@ -17,6 +17,7 @@ def get_lucene_classes():
             _lucene_classes = {
                 'FSDirectory': autoclass('org.apache.lucene.store.FSDirectory'),
                 'Path': autoclass('java.nio.file.Paths'),
+                'StringReader': autoclass('java.io.StringReader'),
                 'Document': autoclass('org.apache.lucene.document.Document'),
                 'Field': autoclass('org.apache.lucene.document.Field'),
                 'TextField': autoclass('org.apache.lucene.document.TextField'),
@@ -32,6 +33,7 @@ def get_lucene_classes():
                 'TermQuery': autoclass('org.apache.lucene.search.TermQuery'),
                 'BooleanQuery' : autoclass('org.apache.lucene.search.BooleanQuery'),
                 'BooleanQueryBuilder' : autoclass('org.apache.lucene.search.BooleanQuery$Builder'),
+                'BoostQuery' : autoclass('org.apache.lucene.search.BoostQuery'),
                 'BooleanClause': autoclass('org.apache.lucene.search.BooleanClause'),
                 'BooleanClauseOccur': autoclass('org.apache.lucene.search.BooleanClause$Occur'),
                 'BM25Similarity' : autoclass('org.apache.lucene.search.similarities.BM25Similarity'),
