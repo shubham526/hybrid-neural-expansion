@@ -252,8 +252,8 @@ class BroadcastFixedTrainer:
                         alpha_grad = self.model.alpha.grad.item() if self.model.alpha.grad is not None else 0
                         beta_grad = self.model.beta.grad.item() if self.model.beta.grad is not None else 0
 
-                        logger.info(f"Step {global_step:4d} | α={alpha:.6f} β={beta:.6f} | Loss={loss.item():.4f}")
-                        logger.info(f"         | ∇α={alpha_grad:+.8f} ∇β={beta_grad:+.8f}")
+                        # logger.info(f"Step {global_step:4d} | α={alpha:.6f} β={beta:.6f} | Loss={loss.item():.4f}")
+                        # logger.info(f"         | ∇α={alpha_grad:+.8f} ∇β={beta_grad:+.8f}")
 
                 # Optimization step
                 self.optimizer.step()
