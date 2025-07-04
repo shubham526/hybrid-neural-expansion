@@ -1,13 +1,15 @@
 """
-Device-Fixed Neural Reranker
+Enhanced Neural Reranker with Configurable Scoring Methods
 
-Fixes the "Expected all tensors to be on the same device" error by ensuring
-all tensor operations use the correct device consistently.
+Supports two scoring approaches:
+1. Neural scoring layers (original)
+2. Cosine similarity scoring
 """
 
 import logging
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from sentence_transformers import SentenceTransformer
@@ -15,9 +17,9 @@ from sentence_transformers import SentenceTransformer
 logger = logging.getLogger(__name__)
 
 
-class ImportanceWeightedNeuralReranker(nn.Module):
+class ConfigurableNeuralReranker(nn.Module):
     """
-    Device-aware neural reranker with proper tensor device handling.
+    Neural reranker with configurable scoring methods.
     """
 
     def __init__(self,
@@ -25,12 +27,14 @@ class ImportanceWeightedNeuralReranker(nn.Module):
                  max_expansion_terms: int = 15,
                  hidden_dim: int = 128,
                  dropout: float = 0.1,
+                 scoring_method: str = "neural",  # "neural", "cosine", or "bilinear"
                  device: str = None):
         super().__init__()
 
         self.model_name = model_name
         self.max_expansion_terms = max_expansion_terms
         self.hidden_dim = hidden_dim
+        self.scoring_method = scoring_method  # NEW
 
         # Load sentence transformer
         self.encoder = SentenceTransformer(model_name, device=device)
@@ -39,8 +43,9 @@ class ImportanceWeightedNeuralReranker(nn.Module):
 
         logger.info(f"Model device: {self.device}")
         logger.info(f"Embedding dimension: {self.embedding_dim}")
+        logger.info(f"Scoring method: {scoring_method}")
 
-        # FIX 1: Ensure learnable parameters are on correct device
+        # Learnable parameters (always needed for both methods)
         self.alpha = nn.Parameter(torch.tensor(0.5, device=self.device, dtype=torch.float32))
         self.beta = nn.Parameter(torch.tensor(0.5, device=self.device, dtype=torch.float32))
 
@@ -48,42 +53,74 @@ class ImportanceWeightedNeuralReranker(nn.Module):
         self.register_parameter('alpha', self.alpha)
         self.register_parameter('beta', self.beta)
 
-        # Scoring layers
-        scoring_input_dim = 2 * self.embedding_dim
+        # Setup scoring layers based on method
+        if scoring_method == "neural":
+            # Original neural scoring layers
+            scoring_input_dim = 2 * self.embedding_dim
 
-        self.scoring_layers = nn.Sequential(
-            nn.Linear(scoring_input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1)
-        ).to(self.device)
+            self.scoring_layers = nn.Sequential(
+                nn.Linear(scoring_input_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim // 2, 1)
+            ).to(self.device)
+
+            self.bilinear_layer = None
+
+        elif scoring_method == "bilinear":
+            # Bilinear scoring: learns interaction between query and doc embeddings
+            self.bilinear_layer = nn.Bilinear(
+                self.embedding_dim,  # query embedding size
+                self.embedding_dim,  # document embedding size
+                1,                   # output size (single score)
+                bias=True
+            ).to(self.device)
+
+            self.scoring_layers = None
+            logger.info("Using bilinear scoring")
+
+        elif scoring_method == "cosine":
+            # No additional layers needed for cosine similarity
+            self.scoring_layers = None
+            self.bilinear_layer = None
+            logger.info("Using cosine similarity scoring - no neural layers")
+
+        else:
+            raise ValueError(f"Unknown scoring method: {scoring_method}. Use 'neural', 'bilinear', or 'cosine'")
 
         # Initialize weights
         self._init_weights()
 
-        logger.info(f"ImportanceWeightedNeuralReranker initialized:")
+        logger.info(f"ConfigurableNeuralReranker initialized:")
         logger.info(f"  Model: {model_name}")
         logger.info(f"  Device: {self.device}")
         logger.info(f"  Embedding dim: {self.embedding_dim}")
+        logger.info(f"  Scoring method: {scoring_method}")
         logger.info(f"  Initial weights: α={self.alpha.item():.3f}, β={self.beta.item():.3f}")
 
     def _init_weights(self):
         """Initialize neural network weights."""
-        for layer in self.scoring_layers:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight)
-                if layer.bias is not None:
-                    nn.init.zeros_(layer.bias)
+        if self.scoring_method == "neural" and self.scoring_layers is not None:
+            for layer in self.scoring_layers:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_uniform_(layer.weight)
+                    if layer.bias is not None:
+                        nn.init.zeros_(layer.bias)
+        elif self.scoring_method == "bilinear" and self.bilinear_layer is not None:
+            # Initialize bilinear layer
+            nn.init.xavier_uniform_(self.bilinear_layer.weight)
+            if self.bilinear_layer.bias is not None:
+                nn.init.zeros_(self.bilinear_layer.bias)
 
     def encode_text(self, text: str) -> torch.Tensor:
         """Encode text ensuring output is on correct device."""
         with torch.no_grad():
-            embedding = self.encoder.encode([text], convert_to_tensor=True)[0]
+            # Disable progress bar for cleaner output
+            embedding = self.encoder.encode([text], convert_to_tensor=True, show_progress_bar=False)[0]
 
-        # FIX 2: Ensure embedding is on correct device
         embedding = embedding.to(self.device, dtype=torch.float32)
         return embedding
 
@@ -93,9 +130,9 @@ class ImportanceWeightedNeuralReranker(nn.Module):
             return torch.zeros(1, self.embedding_dim, device=self.device, dtype=torch.float32)
 
         with torch.no_grad():
-            embeddings = self.encoder.encode(terms, convert_to_tensor=True)
+            # Disable progress bar for cleaner output
+            embeddings = self.encoder.encode(terms, convert_to_tensor=True, show_progress_bar=False)
 
-        # FIX 3: Ensure term embeddings are on correct device
         embeddings = embeddings.to(self.device, dtype=torch.float32)
         return embeddings
 
@@ -187,24 +224,14 @@ class ImportanceWeightedNeuralReranker(nn.Module):
                 expansion_features: Dict[str, Dict[str, float]],
                 document: str) -> torch.Tensor:
         """
-        Forward pass with comprehensive device checking.
+        Forward pass with configurable scoring method.
         """
         try:
             # 1. Create enhanced query embedding
             enhanced_query_emb = self.create_enhanced_query_embedding(query, expansion_features)
 
-            # Device check
-            if enhanced_query_emb.device != self.device:
-                logger.error(f"Enhanced query embedding on wrong device: {enhanced_query_emb.device}, expected: {self.device}")
-                enhanced_query_emb = enhanced_query_emb.to(self.device)
-
             # 2. Get document embedding
             document_emb = self.encode_text(document)
-
-            # Device check
-            if document_emb.device != self.device:
-                logger.error(f"Document embedding on wrong device: {document_emb.device}, expected: {self.device}")
-                document_emb = document_emb.to(self.device)
 
             # 3. Validation
             assert enhanced_query_emb.dim() == 1 and enhanced_query_emb.size(0) == self.embedding_dim
@@ -212,46 +239,113 @@ class ImportanceWeightedNeuralReranker(nn.Module):
             assert enhanced_query_emb.device == self.device
             assert document_emb.device == self.device
 
-            # 4. Concatenate embeddings
-            combined_emb = torch.cat([enhanced_query_emb, document_emb], dim=0)
-
-            # Final device check
-            assert combined_emb.device == self.device, f"Combined embedding on wrong device: {combined_emb.device}"
-
-            # 5. Score via neural network
-            score = self.scoring_layers(combined_emb)
-
-            return score.squeeze()
+            # 4. Score using selected method
+            if self.scoring_method == "neural":
+                return self._neural_scoring(enhanced_query_emb, document_emb)
+            elif self.scoring_method == "bilinear":
+                return self._bilinear_scoring(enhanced_query_emb, document_emb)
+            elif self.scoring_method == "cosine":
+                return self._cosine_scoring(enhanced_query_emb, document_emb)
+            else:
+                raise ValueError(f"Unknown scoring method: {self.scoring_method}")
 
         except Exception as e:
             logger.error(f"Forward pass error: {e}")
             logger.error(f"Model device: {self.device}")
             logger.error(f"Alpha device: {self.alpha.device}")
             logger.error(f"Beta device: {self.beta.device}")
-
-            # Additional debugging
-            try:
-                test_query_emb = self.encode_text(query)
-                test_doc_emb = self.encode_text(document)
-                logger.error(f"Test query embedding device: {test_query_emb.device}")
-                logger.error(f"Test document embedding device: {test_doc_emb.device}")
-            except Exception as debug_e:
-                logger.error(f"Even basic encoding failed: {debug_e}")
-
             raise
+
+    def _neural_scoring(self, query_emb: torch.Tensor, doc_emb: torch.Tensor) -> torch.Tensor:
+        """Score using neural layers (original method)."""
+        # Concatenate embeddings
+        combined_emb = torch.cat([query_emb, doc_emb], dim=0)
+
+        # Final device check
+        assert combined_emb.device == self.device, f"Combined embedding on wrong device: {combined_emb.device}"
+
+        # Score via neural network
+        score = self.scoring_layers(combined_emb)
+        return score.squeeze()
+
+    def _bilinear_scoring(self, query_emb: torch.Tensor, doc_emb: torch.Tensor) -> torch.Tensor:
+        """Score using bilinear layer."""
+        # Add batch dimension for bilinear layer
+        query_emb_batch = query_emb.unsqueeze(0)  # [1, embedding_dim]
+        doc_emb_batch = doc_emb.unsqueeze(0)      # [1, embedding_dim]
+
+        # Compute bilinear score: query^T W doc + b
+        score = self.bilinear_layer(query_emb_batch, doc_emb_batch)  # [1, 1]
+
+        # Return as scalar tensor
+        return score.squeeze()
+
+    def _cosine_scoring(self, query_emb: torch.Tensor, doc_emb: torch.Tensor) -> torch.Tensor:
+        """Score using cosine similarity."""
+        # Compute cosine similarity
+        cosine_sim = F.cosine_similarity(query_emb.unsqueeze(0), doc_emb.unsqueeze(0), dim=1)
+
+        # Return as scalar tensor
+        return cosine_sim.squeeze()
 
     def get_learned_weights(self) -> Tuple[float, float]:
         """Get current learned α and β values."""
         return self.alpha.item(), self.beta.item()
 
+    def get_scoring_method(self) -> str:
+        """Get current scoring method."""
+        return self.scoring_method
+
+    def switch_scoring_method(self, new_method: str):
+        """
+        Switch scoring method (experimental - use with caution).
+
+        Note: This recreates the scoring layers, so only use before training
+        or be prepared to retrain.
+        """
+        if new_method not in ["neural", "bilinear", "cosine"]:
+            raise ValueError(f"Unknown scoring method: {new_method}")
+
+        old_method = self.scoring_method
+        self.scoring_method = new_method
+
+        # Clean up old layers
+        self.scoring_layers = None
+        self.bilinear_layer = None
+
+        if new_method == "neural":
+            # Add neural layers
+            scoring_input_dim = 2 * self.embedding_dim
+            self.scoring_layers = nn.Sequential(
+                nn.Linear(scoring_input_dim, self.hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(self.hidden_dim // 2, 1)
+            ).to(self.device)
+
+        elif new_method == "bilinear":
+            # Add bilinear layer
+            self.bilinear_layer = nn.Bilinear(
+                self.embedding_dim,
+                self.embedding_dim,
+                1,
+                bias=True
+            ).to(self.device)
+
+        # cosine method needs no additional layers
+
+        # Initialize new layers
+        self._init_weights()
+        logger.info(f"Switched scoring method from {old_method} to {new_method}")
+
     def to(self, device):
         """Override to method to ensure sentence transformer is also moved."""
         super().to(device)
-
-        # FIX 7: Also move the sentence transformer
         self.encoder = self.encoder.to(device)
         self.device = device
-
         logger.info(f"Model moved to device: {device}")
         return self
 
@@ -301,54 +395,60 @@ class ImportanceWeightedNeuralReranker(nn.Module):
         return results[:top_k]
 
 
-# Factory function
+# Factory function with scoring method option
 def create_neural_reranker(model_name: str = 'all-MiniLM-L6-v2',
-                           **kwargs) -> ImportanceWeightedNeuralReranker:
-    """Factory function to create neural reranker."""
-    return ImportanceWeightedNeuralReranker(model_name=model_name, **kwargs)
+                           scoring_method: str = "neural",  # NEW parameter
+                           **kwargs) -> ConfigurableNeuralReranker:
+    """
+    Factory function to create neural reranker with configurable scoring.
+
+    Args:
+        model_name: Sentence transformer model name
+        scoring_method: "neural" (default) or "cosine"
+        **kwargs: Other model parameters
+
+    Returns:
+        Configured neural reranker
+    """
+    return ConfigurableNeuralReranker(model_name=model_name, scoring_method=scoring_method, **kwargs)
 
 
-# Device debugging utility
-def check_model_devices(model):
-    """Debug function to check all model component devices."""
-    print("=== MODEL DEVICE CHECK ===")
-    print(f"Model device attribute: {model.device}")
-    print(f"Encoder device: {model.encoder.device}")
-
-    for name, param in model.named_parameters():
-        print(f"Parameter {name}: {param.device}")
-
-    for name, module in model.named_modules():
-        if hasattr(module, 'weight') and module.weight is not None:
-            print(f"Module {name} weight: {module.weight.device}")
-
-    print("=== END DEVICE CHECK ===")
-
-
+# Example usage and comparison
 if __name__ == "__main__":
-    # Test device handling
-    print("Testing device handling...")
+    print("Testing configurable neural reranker...")
 
-    # Create model
-    reranker = create_neural_reranker()
-    print(f"Initial device: {reranker.device}")
+    # Test all three scoring methods
+    for method in ["neural", "bilinear", "cosine"]:
+        print(f"\n--- Testing {method} scoring ---")
 
-    # Check devices
-    check_model_devices(reranker)
+        reranker = create_neural_reranker(scoring_method=method)
+        print(f"Scoring method: {reranker.get_scoring_method()}")
 
-    # Test data
-    query = "machine learning algorithms"
-    document = "Neural networks are machine learning algorithms."
-    expansion_features = {
-        "neural": {"rm_weight": 0.5, "semantic_score": 0.8},
-        "algorithm": {"rm_weight": 0.7, "semantic_score": 0.9}
-    }
+        # Count parameters
+        total_params = sum(p.numel() for p in reranker.parameters())
+        trainable_params = sum(p.numel() for p in reranker.parameters() if p.requires_grad)
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters: {trainable_params:,}")
 
-    try:
-        score = reranker.forward(query, expansion_features, document)
-        print(f"Forward pass successful! Score: {score.item()}")
-        print(f"Score device: {score.device}")
-    except Exception as e:
-        print(f"Test failed: {e}")
-        import traceback
-        traceback.print_exc()
+        # Test data
+        query = "machine learning algorithms"
+        document = "Neural networks are machine learning algorithms."
+        expansion_features = {
+            "neural": {"rm_weight": 0.5, "semantic_score": 0.8, "original_term": "neural"},
+            "algorithm": {"rm_weight": 0.7, "semantic_score": 0.9, "original_term": "algorithms"}
+        }
+
+        try:
+            score = reranker.forward(query, expansion_features, document)
+            print(f"Score: {score.item():.4f}")
+            print(f"Score device: {score.device}")
+
+            alpha, beta = reranker.get_learned_weights()
+            print(f"Learned weights: α={alpha:.3f}, β={beta:.3f}")
+
+        except Exception as e:
+            print(f"Test failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    print("\nConfigurable reranker test complete!")

@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-Train Neural Reranker from JSONL Data
+Enhanced Train Neural Reranker with Dev Set Evaluation
 
-Updated for the new document-aware reranker that requires document content.
+Updated to:
+1. Load evaluation data (queries, documents, qrels)
+2. Evaluate after each epoch
+3. Save best model based on dev set performance
+4. Create dev run files for each epoch
 """
 
 import argparse
@@ -12,17 +16,19 @@ import sys
 import torch
 from pathlib import Path
 from typing import Dict, List, Any
+from collections import defaultdict
 
 # Add project root to path
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
+import ir_datasets
+
 from src.models.reranker import create_neural_reranker
-from src.models.trainer import Trainer
+from src.models.trainer import EvaluationAwareTrainer
 from src.utils.file_utils import save_json, ensure_dir
 from src.utils.logging_utils import setup_experiment_logging, log_experiment_info, TimedOperation
-from src.utils.data_utils import DocumentAwareExpansionDataset, PairwiseExpansionDataset
-
+from src.utils.data_utils import DocumentAwareExpansionDataset, PairwiseExpansionDataset, expansion_collate_fn
 
 logger = logging.getLogger(__name__)
 
@@ -37,28 +43,281 @@ def load_jsonl(filepath: Path) -> List[Dict]:
     return data
 
 
-def validate_training_data(data: List[Dict]) -> Dict[str, Any]:
+def get_query_text(query_obj):
+    """Extract query text from ir_datasets query object."""
+    if hasattr(query_obj, 'text'):
+        return query_obj.text
+    elif hasattr(query_obj, 'title'):
+        return query_obj.title
+    return ""
+
+
+class DocumentLoader:
+    """Document loader for evaluation."""
+
+    def __init__(self, dataset=None, documents_dict=None):
+        """
+        Initialize document loader.
+
+        Args:
+            dataset: ir_datasets dataset object
+            documents_dict: Pre-loaded documents dictionary {doc_id: doc_text}
+        """
+        self.documents = {}
+
+        if documents_dict:
+            self.documents = documents_dict
+            logger.info(f"Initialized DocumentLoader with {len(self.documents)} pre-loaded documents")
+        elif dataset:
+            self._load_documents_from_dataset(dataset)
+        else:
+            logger.warning("No documents provided to DocumentLoader")
+
+    def _load_documents_from_dataset(self, dataset):
+        """Load documents from ir_datasets dataset."""
+        logger.info("Loading documents from dataset...")
+
+        for doc in dataset.docs_iter():
+            if hasattr(doc, 'text'):
+                doc_text = doc.text
+            elif hasattr(doc, 'body'):
+                title = getattr(doc, 'title', '')
+                body = doc.body
+                doc_text = f"{title} {body}".strip() if title else body
+            else:
+                doc_text = str(doc)
+
+            self.documents[doc.doc_id] = doc_text
+
+        logger.info(f"Loaded {len(self.documents)} documents from dataset")
+
+    def get_document(self, doc_id: str) -> str:
+        """Get document text by ID."""
+        return self.documents.get(doc_id, "")
+
+
+def load_qrels_file(qrels_file: Path) -> Dict[str, Dict[str, int]]:
     """
-    Validate that training data has required fields for document-aware training.
+    Load qrels from TREC format file.
+
+    Args:
+        qrels_file: Path to qrels file
 
     Returns:
-        Validation statistics
+        Dictionary {query_id: {doc_id: relevance}}
     """
+    logger.info(f"Loading qrels from: {qrels_file}")
+
+    qrels = defaultdict(dict)
+
+    with open(qrels_file, 'r') as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            parts = line.split()
+            if len(parts) < 4:
+                logger.warning(f"Invalid qrels line {line_num}: {line}")
+                continue
+
+            query_id = parts[0]
+            doc_id = parts[2]
+            try:
+                relevance = int(parts[3])
+                qrels[query_id][doc_id] = relevance
+            except ValueError:
+                logger.warning(f"Invalid relevance score on line {line_num}: {parts[3]}")
+                continue
+
+    logger.info(f"Loaded qrels for {len(qrels)} queries")
+    return dict(qrels)
+
+
+def load_evaluation_data_from_jsonl(val_file: Path, dev_qrels_file: Path = None, dataset_name: str = None):
+    """
+    Load evaluation data from validation JSONL file.
+
+    Args:
+        val_file: Path to validation JSONL file
+        dataset_name: Dataset name for loading documents via ir_datasets
+
+    Returns:
+        Tuple of (queries, qrels, document_loader)
+    """
+
+
+def load_evaluation_data_from_jsonl(val_file: Path, dev_qrels_file: Path = None, dataset_name: str = None):
+    """
+    Load evaluation data from validation JSONL file and optional qrels file.
+
+    Args:
+        val_file: Path to validation JSONL file
+        dev_qrels_file: Path to dev qrels file (TREC format)
+        dataset_name: Dataset name for loading documents via ir_datasets
+
+    Returns:
+        Tuple of (queries, qrels, document_loader)
+    """
+    logger.info(f"Loading evaluation data from JSONL: {val_file}")
+
+    val_data = load_jsonl(val_file)
+
+    # Extract queries
+    queries = {}
+    all_doc_ids = set()
+
+    for example in val_data:
+        query_id = example['query_id']
+        queries[query_id] = example['query_text']
+
+        # Collect all document IDs
+        for candidate in example['candidates']:
+            doc_id = candidate['doc_id']
+            all_doc_ids.add(doc_id)
+
+    logger.info(f"Extracted {len(queries)} queries from JSONL")
+
+    # Load qrels from external file if provided
+    qrels = {}
+    if dev_qrels_file and dev_qrels_file.exists():
+        all_qrels = load_qrels_file(dev_qrels_file)
+        # Filter to only queries present in validation data
+        qrels = {qid: qrel_dict for qid, qrel_dict in all_qrels.items() if qid in queries}
+        logger.info(f"Loaded qrels for {len(qrels)} validation queries from external file")
+    else:
+        # Fallback: extract qrels from JSONL file
+        logger.info("No external qrels file provided, extracting from JSONL...")
+        qrels_from_jsonl = defaultdict(dict)
+
+        for example in val_data:
+            query_id = example['query_id']
+            for candidate in example['candidates']:
+                doc_id = candidate['doc_id']
+                relevance = candidate['relevance']
+                if relevance > 0:  # Only store positive relevance judgments
+                    qrels_from_jsonl[query_id][doc_id] = relevance
+
+        qrels = dict(qrels_from_jsonl)
+        logger.info(f"Extracted qrels for {len(qrels)} queries from JSONL")
+
+    # Load documents
+    document_loader = None
+    if dataset_name:
+        try:
+            dataset = ir_datasets.load(dataset_name)
+            document_loader = DocumentLoader(dataset=dataset)
+        except Exception as e:
+            logger.warning(f"Could not load dataset {dataset_name}: {e}")
+
+    # If no dataset or loading failed, try to extract documents from JSONL
+    if not document_loader:
+        logger.info("Extracting documents from JSONL file...")
+        documents_dict = {}
+
+        for example in val_data:
+            for candidate in example['candidates']:
+                if 'doc_text' in candidate:
+                    documents_dict[candidate['doc_id']] = candidate['doc_text']
+
+        document_loader = DocumentLoader(documents_dict=documents_dict)
+
+    return dict(queries), qrels, document_loader
+
+
+def load_evaluation_data_from_dataset(dataset_name: str, val_file: Path = None, dev_qrels_file: Path = None):
+    def load_evaluation_data_from_dataset(dataset_name: str, val_file: Path = None, dev_qrels_file: Path = None):
+        """
+        Load evaluation data from ir_datasets with optional external qrels.
+
+        Args:
+            dataset_name: ir_datasets dataset name
+            val_file: Optional validation file to filter queries
+            dev_qrels_file: Path to external dev qrels file (TREC format)
+
+        Returns:
+            Tuple of (queries, qrels, document_loader)
+        """
+        logger.info(f"Loading evaluation data from dataset: {dataset_name}")
+
+        dataset = ir_datasets.load(dataset_name)
+
+        # Load all queries
+        all_queries = {q.query_id: get_query_text(q) for q in dataset.queries_iter()}
+
+        # Filter to validation queries if file provided
+        if val_file and val_file.exists():
+            val_data = load_jsonl(val_file)
+            val_query_ids = {example['query_id'] for example in val_data}
+            queries = {qid: text for qid, text in all_queries.items() if qid in val_query_ids}
+            logger.info(f"Filtered to {len(queries)} validation queries")
+        else:
+            queries = all_queries
+            logger.info(f"Using all {len(queries)} queries for evaluation")
+
+        # Load qrels - prioritize external file over dataset qrels
+        qrels = {}
+        if dev_qrels_file and dev_qrels_file.exists():
+            all_qrels = load_qrels_file(dev_qrels_file)
+            # Filter to only queries present in our query set
+            qrels = {qid: qrel_dict for qid, qrel_dict in all_qrels.items() if qid in queries}
+            logger.info(f"Loaded qrels for {len(qrels)} queries from external file")
+        else:
+            # Fallback to dataset qrels
+            logger.info("No external qrels file provided, using dataset qrels...")
+            qrels_from_dataset = defaultdict(dict)
+            for qrel in dataset.qrels_iter():
+                if qrel.query_id in queries:
+                    qrels_from_dataset[qrel.query_id][qrel.doc_id] = qrel.relevance
+            qrels = dict(qrels_from_dataset)
+            logger.info(f"Loaded qrels for {len(qrels)} queries from dataset")
+
+        # Load documents
+        document_loader = DocumentLoader(dataset=dataset)
+
+        return queries, qrels, document_loader
+
+
+def validate_training_data(data: List[Dict]) -> Dict[str, Any]:
+    """Validate training data has required fields."""
     total_examples = len(data)
     queries_with_doc_text = 0
     total_candidates = 0
     candidates_with_doc_text = 0
 
     for example in data:
-        # Check if this query has any candidates with document text
         has_doc_text = False
-
         for candidate in example.get('candidates', []):
             total_candidates += 1
             if 'doc_text' in candidate:
                 candidates_with_doc_text += 1
                 has_doc_text = True
+        if has_doc_text:
+            queries_with_doc_text += 1
 
+    stats = {
+        'total_queries': total_examples,
+        'queries_with_doc_text': queries_with_doc_text,
+        'total_candidates': total_candidates,
+        'candidates_with_doc_text': candidates_with_doc_text,
+        'query_coverage': queries_with_doc_text / total_examples if total_examples > 0 else 0,
+        'candidate_coverage': candidates_with_doc_text / total_candidates if total_candidates > 0 else 0
+    }
+
+    return stats
+    """Validate training data has required fields."""
+    total_examples = len(data)
+    queries_with_doc_text = 0
+    total_candidates = 0
+    candidates_with_doc_text = 0
+
+    for example in data:
+        has_doc_text = False
+        for candidate in example.get('candidates', []):
+            total_candidates += 1
+            if 'doc_text' in candidate:
+                candidates_with_doc_text += 1
+                has_doc_text = True
         if has_doc_text:
             queries_with_doc_text += 1
 
@@ -75,15 +334,19 @@ def validate_training_data(data: List[Dict]) -> Dict[str, Any]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train neural reranker from JSONL data")
+    parser = argparse.ArgumentParser(description="Train neural reranker with dev set evaluation")
 
     # Data arguments
     parser.add_argument('--train-file', type=str, required=True,
                         help='Path to train.jsonl file')
     parser.add_argument('--val-file', type=str,
-                        help='Path to validation.jsonl file (optional)')
+                        help='Path to validation.jsonl file')
+    parser.add_argument('--dev-qrels', type=str,
+                        help='Path to dev qrels file (TREC format) for evaluation')
+    parser.add_argument('--dataset', type=str,
+                        help='Dataset name for loading documents (optional)')
     parser.add_argument('--output-dir', type=str, required=True,
-                        help='Output directory for trained model')
+                        help='Output directory for trained model and evaluation results')
 
     # Model arguments
     parser.add_argument('--model-name', type=str, default='all-MiniLM-L6-v2',
@@ -94,6 +357,9 @@ def main():
                         help='Hidden dimension for neural layers')
     parser.add_argument('--dropout', type=float, default=0.1,
                         help='Dropout rate')
+    parser.add_argument('--scoring-method', type=str, default='neural',
+                        choices=['neural', 'bilinear', 'cosine'],
+                        help='Scoring method: neural layers, bilinear, or cosine similarity')
 
     # Training arguments
     parser.add_argument('--num-epochs', type=int, default=20,
@@ -119,6 +385,14 @@ def main():
     parser.add_argument('--max-pairs-per-query', type=int, default=50,
                         help='Maximum positive-negative pairs per query (pairwise mode)')
 
+    # NEW: Evaluation arguments
+    parser.add_argument('--eval-metric', type=str, default='ndcg_cut_20',
+                        help='Metric for best model selection')
+    parser.add_argument('--patience', type=int, default=5,
+                        help='Early stopping patience (epochs without improvement)')
+    parser.add_argument('--disable-dev-eval', action='store_true',
+                        help='Disable dev set evaluation (use original training)')
+
     parser.add_argument('--device', type=str, default=None,
                         help='Device (cuda/cpu)')
     parser.add_argument('--log-level', type=str, default='INFO')
@@ -137,25 +411,76 @@ def main():
             train_data = load_jsonl(Path(args.train_file))
             logger.info(f"Loaded {len(train_data)} training examples")
 
-            # Validate training data
             train_stats = validate_training_data(train_data)
             logger.info("Training data validation:")
-            logger.info(
-                f"  Queries with document text: {train_stats['queries_with_doc_text']}/{train_stats['total_queries']} ({train_stats['query_coverage']:.1%})")
-            logger.info(
-                f"  Candidates with document text: {train_stats['candidates_with_doc_text']}/{train_stats['total_candidates']} ({train_stats['candidate_coverage']:.1%})")
+            logger.info(f"  Query coverage: {train_stats['query_coverage']:.1%}")
+            logger.info(f"  Candidate coverage: {train_stats['candidate_coverage']:.1%}")
 
             if train_stats['candidate_coverage'] < 0.5:
-                logger.warning(
-                    "Less than 50% of candidates have document text. Consider regenerating training data with document content.")
+                logger.warning("Less than 50% of candidates have document text!")
 
-            # Load validation data
-            val_data = None
-            if args.val_file:
+        # Load validation data and evaluation components
+        val_data = None
+        queries = None
+        qrels = None
+        document_loader = None
+
+        if args.val_file and not args.disable_dev_eval:
+            with TimedOperation(logger, "Loading evaluation data"):
                 val_data = load_jsonl(Path(args.val_file))
                 val_stats = validate_training_data(val_data)
                 logger.info(f"Loaded {len(val_data)} validation examples")
-                logger.info(f"  Validation document coverage: {val_stats['candidate_coverage']:.1%}")
+                logger.info(f"Validation coverage: {val_stats['candidate_coverage']:.1%}")
+
+                # Require dev qrels for evaluation
+                if not args.dev_qrels:
+                    logger.error(
+                        "--dev-qrels is required when --val-file is provided (unless --disable-dev-eval is used)")
+                    logger.error("Please provide path to dev qrels file in TREC format")
+                    sys.exit(1)
+
+                dev_qrels_path = Path(args.dev_qrels)
+                if not dev_qrels_path.exists():
+                    logger.error(f"Dev qrels file not found: {dev_qrels_path}")
+                    sys.exit(1)
+
+                # Load evaluation components
+                if args.dataset:
+                    # Load from dataset with external qrels
+                    queries, qrels, document_loader = load_evaluation_data_from_dataset(
+                        args.dataset, Path(args.val_file), dev_qrels_path
+                    )
+                else:
+                    # Load from JSONL with external qrels
+                    queries, qrels, document_loader = load_evaluation_data_from_jsonl(
+                        Path(args.val_file), dev_qrels_path, args.dataset
+                    )
+
+                logger.info(f"Evaluation setup:")
+                logger.info(f"  Queries: {len(queries)}")
+                logger.info(f"  Qrels: {len(qrels)} queries with relevance judgments")
+                logger.info(f"  Documents: {len(document_loader.documents)}")
+
+                # Validate that we have qrels for validation queries
+                val_query_ids = {example['query_id'] for example in val_data}
+                qrels_query_ids = set(qrels.keys())
+                common_queries = val_query_ids & qrels_query_ids
+
+                if not common_queries:
+                    logger.error("No overlap between validation queries and qrels!")
+                    logger.error(f"Validation queries: {len(val_query_ids)}")
+                    logger.error(f"Qrels queries: {len(qrels_query_ids)}")
+                    sys.exit(1)
+                elif len(common_queries) < len(val_query_ids):
+                    logger.warning(f"Only {len(common_queries)}/{len(val_query_ids)} validation queries have qrels")
+
+        elif args.disable_dev_eval:
+            logger.info("Dev set evaluation disabled - using original training mode")
+            if args.val_file:
+                val_data = load_jsonl(Path(args.val_file))
+                logger.info(f"Loaded {len(val_data)} validation examples (loss computation only)")
+        else:
+            logger.info("No validation file provided - training without validation")
 
         # Create datasets
         with TimedOperation(logger, "Creating datasets"):
@@ -194,22 +519,33 @@ def main():
                 max_expansion_terms=args.max_expansion_terms,
                 hidden_dim=args.hidden_dim,
                 dropout=args.dropout,
+                scoring_method=args.scoring_method,  # NEW parameter
                 device=args.device
             )
 
             initial_alpha, initial_beta = reranker.get_learned_weights()
             logger.info(f"Initial weights: α={initial_alpha:.3f}, β={initial_beta:.3f}")
+            logger.info(f"Scoring method: {reranker.get_scoring_method()}")
 
-        # Create trainer and train
-        with TimedOperation(logger, f"Training for {args.num_epochs} epochs"):
-            trainer = Trainer(
+        # Create trainer
+        with TimedOperation(logger, "Initializing trainer"):
+            trainer = EvaluationAwareTrainer(
                 model=reranker,
                 learning_rate=args.learning_rate,
                 weight_decay=args.weight_decay,
                 batch_size=args.batch_size,
-                loss_type=args.loss_type
+                loss_type=args.loss_type,
+                # NEW: Evaluation parameters
+                queries=queries,
+                document_loader=document_loader,
+                qrels=qrels,
+                output_dir=output_dir,
+                eval_metric=args.eval_metric,
+                patience=args.patience
             )
 
+        # Train model
+        with TimedOperation(logger, f"Training for {args.num_epochs} epochs"):
             history = trainer.train(
                 train_dataset=train_dataset,
                 val_dataset=val_dataset,
@@ -217,19 +553,21 @@ def main():
             )
 
         # Save results
-        with TimedOperation(logger, "Saving trained model"):
-            # Save model state
-            model_path = output_dir / 'neural_reranker.pt'
-            torch.save(reranker.state_dict(), model_path)
+        with TimedOperation(logger, "Saving trained model and results"):
+            # Save final model state (in addition to best model)
+            final_model_path = output_dir / 'final_model.pt'
+            torch.save(reranker.state_dict(), final_model_path)
 
-            # Save model info
+            # Get final weights
             final_alpha, final_beta = reranker.get_learned_weights()
 
+            # Create comprehensive model info
             model_info = {
                 'model_name': args.model_name,
                 'max_expansion_terms': args.max_expansion_terms,
                 'hidden_dim': args.hidden_dim,
                 'dropout': args.dropout,
+                'scoring_method': args.scoring_method,  # NEW field
                 'learned_weights': {
                     'alpha': final_alpha,
                     'beta': final_beta
@@ -241,9 +579,11 @@ def main():
                     'batch_size': args.batch_size,
                     'loss_type': args.loss_type,
                     'training_mode': args.training_mode,
-                    'max_candidates_per_query': args.max_candidates_per_query
+                    'max_candidates_per_query': args.max_candidates_per_query,
+                    'eval_metric': args.eval_metric,
+                    'patience': args.patience
                 },
-                'model_path': str(model_path),
+                'final_model_path': str(final_model_path),
                 'training_history': history,
                 'data_validation': {
                     'train_stats': train_stats,
@@ -251,16 +591,36 @@ def main():
                 }
             }
 
+            # Add evaluation results if available
+            if hasattr(trainer, 'best_score') and trainer.best_score > 0:
+                model_info['best_dev_performance'] = {
+                    'best_epoch': trainer.best_epoch,
+                    'best_score': trainer.best_score,
+                    'metric': args.eval_metric
+                }
+
+            if hasattr(trainer, 'eval_history'):
+                model_info['eval_history'] = trainer.eval_history
+
             save_json(model_info, output_dir / 'model_info.json')
             save_json(history, output_dir / 'training_history.json')
 
+            # Log training completion
             logger.info("TRAINING COMPLETED!")
             logger.info(f"Initial weights: α={initial_alpha:.4f}, β={initial_beta:.4f}")
             logger.info(f"Final weights: α={final_alpha:.4f}, β={final_beta:.4f}")
-            logger.info(f"Weight change: Δα={final_alpha - initial_alpha:+.4f}, Δβ={final_beta - initial_beta:+.4f}")
-            logger.info(f"Model saved to: {model_path}")
+            logger.info(f"Weight changes: Δα={final_alpha - initial_alpha:+.4f}, Δβ={final_beta - initial_beta:+.4f}")
 
-            # Log final performance if available
+            # Log best model info
+            if hasattr(trainer, 'best_score') and trainer.best_score > 0:
+                logger.info(f"Best model: Epoch {trainer.best_epoch}, {args.eval_metric}={trainer.best_score:.4f}")
+                best_model_path = output_dir / 'best_model.pt'
+                if best_model_path.exists():
+                    logger.info(f"Best model saved to: {best_model_path}")
+
+            logger.info(f"Final model saved to: {final_model_path}")
+
+            # Log performance summary
             if history['train_loss']:
                 initial_loss = history['train_loss'][0]
                 final_loss = history['train_loss'][-1]
@@ -270,6 +630,11 @@ def main():
             if history['val_loss']:
                 final_val_loss = history['val_loss'][-1]
                 logger.info(f"Final validation loss: {final_val_loss:.4f}")
+
+            if history.get('dev_scores'):
+                dev_scores = [s for s in history['dev_scores'] if s > 0]
+                if dev_scores:
+                    logger.info(f"Dev {args.eval_metric}: {dev_scores[0]:.4f} → {dev_scores[-1]:.4f}")
 
     except Exception as e:
         logger.error(f"Training failed: {e}", exc_info=True)

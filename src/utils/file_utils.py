@@ -8,6 +8,7 @@ from typing import Dict, List, Any, Optional, Union
 from pathlib import Path
 import tempfile
 from datetime import datetime
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -585,6 +586,363 @@ def load_learned_weights(filepath: Union[str, Path]) -> tuple:
     data = load_json(filepath)
     weights = data['weights']
     return (weights['alpha'], weights['beta'], weights['gamma'])
+
+
+def save_model_checkpoint(model: torch.nn.Module,
+                          epoch: int,
+                          score: float,
+                          filepath: Path,
+                          metadata: Optional[Dict[str, Any]] = None,
+                          is_best: bool = False) -> None:
+    """
+    Save model checkpoint with comprehensive metadata.
+
+    Args:
+        model: PyTorch model to save
+        epoch: Current epoch number
+        score: Performance score for this epoch
+        filepath: Path to save checkpoint
+        metadata: Additional metadata to save
+        is_best: Whether this is the best model so far
+    """
+    filepath = Path(filepath)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    # Create checkpoint data
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'score': score,
+        'timestamp': datetime.now().isoformat(),
+        'is_best': is_best
+    }
+
+    # Add learned weights if available
+    if hasattr(model, 'get_learned_weights'):
+        alpha, beta = model.get_learned_weights()
+        checkpoint['learned_weights'] = {'alpha': alpha, 'beta': beta}
+
+    # Add metadata
+    if metadata:
+        checkpoint['metadata'] = metadata
+
+    # Save checkpoint
+    torch.save(checkpoint, filepath)
+
+    logger.info(f"Saved checkpoint: epoch {epoch}, score {score:.4f} -> {filepath}")
+
+    # Also save a separate info file for easy reading
+    info_file = filepath.with_suffix('.json')
+    checkpoint_info = {k: v for k, v in checkpoint.items() if k != 'model_state_dict'}
+    with open(info_file, 'w') as f:
+        json.dump(checkpoint_info, f, indent=2)
+
+
+def load_model_checkpoint(model: torch.nn.Module,
+                          filepath: Path,
+                          device: str = None) -> Dict[str, Any]:
+    """
+    Load model checkpoint and return metadata.
+
+    Args:
+        model: PyTorch model to load weights into
+        filepath: Path to checkpoint file
+        device: Device to load model on
+
+    Returns:
+        Dictionary with checkpoint metadata
+    """
+    filepath = Path(filepath)
+
+    if not filepath.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {filepath}")
+
+    # Load checkpoint
+    if device:
+        checkpoint = torch.load(filepath, map_location=device)
+    else:
+        checkpoint = torch.load(filepath)
+
+    # Load model weights
+    model.load_state_dict(checkpoint['model_state_dict'])
+
+    # Extract metadata
+    metadata = {k: v for k, v in checkpoint.items() if k != 'model_state_dict'}
+
+    logger.info(f"Loaded checkpoint: epoch {metadata.get('epoch', '?')}, "
+                f"score {metadata.get('score', 0):.4f} from {filepath}")
+
+    return metadata
+
+
+def save_best_model_info(output_dir: Path,
+                         epoch: int,
+                         score: float,
+                         metric: str,
+                         model_path: Path,
+                         learned_weights: Optional[Dict[str, float]] = None) -> None:
+    """
+    Save information about the best model.
+
+    Args:
+        output_dir: Output directory
+        epoch: Epoch number of best model
+        score: Best score achieved
+        metric: Metric used for selection
+        model_path: Path to saved model
+        learned_weights: Learned weight values
+    """
+    best_model_info = {
+        'best_epoch': epoch,
+        'best_score': score,
+        'metric': metric,
+        'model_path': str(model_path),
+        'saved_at': datetime.now().isoformat()
+    }
+
+    if learned_weights:
+        best_model_info['learned_weights'] = learned_weights
+
+    info_path = output_dir / 'best_model_info.json'
+    with open(info_path, 'w') as f:
+        json.dump(best_model_info, f, indent=2)
+
+    logger.info(f"Updated best model info: epoch {epoch}, {metric}={score:.4f}")
+
+
+def load_best_model_info(checkpoint_dir: Path) -> Optional[Dict[str, Any]]:
+    """
+    Load information about the best model.
+
+    Args:
+        checkpoint_dir: Directory containing checkpoints
+
+    Returns:
+        Best model information or None if not found
+    """
+    info_path = checkpoint_dir / 'best_model_info.json'
+
+    if not info_path.exists():
+        logger.warning(f"Best model info not found: {info_path}")
+        return None
+
+    with open(info_path, 'r') as f:
+        return json.load(f)
+
+
+def create_run_filename(epoch: int, prefix: str = "dev_run") -> str:
+    """
+    Create standardized run filename.
+
+    Args:
+        epoch: Epoch number
+        prefix: Filename prefix
+
+    Returns:
+        Formatted filename
+    """
+    return f"{prefix}_epoch_{epoch}.txt"
+
+
+def save_epoch_run_file(run_results: Dict[str, Any],
+                        output_dir: Path,
+                        epoch: int,
+                        run_name: str = None) -> Path:
+    """
+    Save run file for a specific epoch.
+
+    Args:
+        run_results: Run results {query_id: [(doc_id, score), ...]}
+        output_dir: Output directory
+        epoch: Epoch number
+        run_name: Optional run name (default: neural_epoch_N)
+
+    Returns:
+        Path to saved run file
+    """
+    if run_name is None:
+        run_name = f"neural_epoch_{epoch}"
+
+    filename = create_run_filename(epoch)
+    filepath = output_dir / filename
+
+    # Ensure directory exists
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    # Save in TREC format
+    with open(filepath, 'w') as f:
+        for query_id, docs in run_results.items():
+            for rank, (doc_id, score) in enumerate(docs, 1):
+                f.write(f"{query_id} Q0 {doc_id} {rank} {score:.6f} {run_name}\n")
+
+    logger.debug(f"Saved epoch {epoch} run file: {filepath}")
+    return filepath
+
+
+def cleanup_old_checkpoints(checkpoint_dir: Path,
+                            keep_best: bool = True,
+                            keep_latest: int = 3,
+                            pattern: str = "checkpoint_epoch_*.pt") -> None:
+    """
+    Clean up old checkpoint files to save disk space.
+
+    Args:
+        checkpoint_dir: Directory containing checkpoints
+        keep_best: Whether to keep the best model
+        keep_latest: Number of latest checkpoints to keep
+        pattern: File pattern for checkpoints
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+
+    if not checkpoint_dir.exists():
+        return
+
+    # Find all checkpoint files
+    checkpoint_files = list(checkpoint_dir.glob(pattern))
+
+    if len(checkpoint_files) <= keep_latest:
+        logger.debug("Not enough checkpoints to clean up")
+        return
+
+    # Sort by modification time (newest first)
+    checkpoint_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+
+    # Files to keep
+    files_to_keep = set()
+
+    # Keep latest N checkpoints
+    files_to_keep.update(checkpoint_files[:keep_latest])
+
+    # Keep best model if requested
+    if keep_best:
+        best_model_path = checkpoint_dir / 'best_model.pt'
+        if best_model_path.exists():
+            files_to_keep.add(best_model_path)
+
+    # Delete old checkpoints
+    deleted_count = 0
+    for checkpoint_file in checkpoint_files:
+        if checkpoint_file not in files_to_keep:
+            try:
+                checkpoint_file.unlink()
+                # Also remove corresponding .json file if it exists
+                json_file = checkpoint_file.with_suffix('.json')
+                if json_file.exists():
+                    json_file.unlink()
+                deleted_count += 1
+            except Exception as e:
+                logger.warning(f"Could not delete {checkpoint_file}: {e}")
+
+    if deleted_count > 0:
+        logger.info(f"Cleaned up {deleted_count} old checkpoint files")
+
+
+def get_checkpoint_summary(checkpoint_dir: Path) -> Dict[str, Any]:
+    """
+    Get summary of available checkpoints.
+
+    Args:
+        checkpoint_dir: Directory containing checkpoints
+
+    Returns:
+        Summary information about checkpoints
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+
+    summary = {
+        'checkpoint_dir': str(checkpoint_dir),
+        'total_checkpoints': 0,
+        'best_model_available': False,
+        'latest_checkpoint': None,
+        'best_model_info': None,
+        'available_run_files': []
+    }
+
+    if not checkpoint_dir.exists():
+        return summary
+
+    # Count checkpoints
+    checkpoint_files = list(checkpoint_dir.glob("*.pt"))
+    summary['total_checkpoints'] = len(checkpoint_files)
+
+    # Check for best model
+    best_model_path = checkpoint_dir / 'best_model.pt'
+    summary['best_model_available'] = best_model_path.exists()
+
+    # Get best model info
+    if summary['best_model_available']:
+        summary['best_model_info'] = load_best_model_info(checkpoint_dir)
+
+    # Find latest checkpoint
+    if checkpoint_files:
+        latest_file = max(checkpoint_files, key=lambda x: x.stat().st_mtime)
+        summary['latest_checkpoint'] = str(latest_file)
+
+    # List run files
+    run_files = list(checkpoint_dir.glob("dev_run_epoch_*.txt"))
+    run_files.sort()
+    summary['available_run_files'] = [str(f) for f in run_files]
+
+    return summary
+
+
+def restore_best_model(checkpoint_dir: Path,
+                       model: torch.nn.Module,
+                       device: str = None) -> Optional[Dict[str, Any]]:
+    """
+    Restore the best model from checkpoints.
+
+    Args:
+        checkpoint_dir: Directory containing checkpoints
+        model: Model to load weights into
+        device: Device to load on
+
+    Returns:
+        Best model metadata or None if not found
+    """
+    best_model_path = checkpoint_dir / 'best_model.pt'
+
+    if not best_model_path.exists():
+        logger.warning(f"Best model not found: {best_model_path}")
+        return None
+
+    try:
+        metadata = load_model_checkpoint(model, best_model_path, device)
+        logger.info(f"Restored best model from epoch {metadata.get('epoch', '?')}")
+        return metadata
+    except Exception as e:
+        logger.error(f"Failed to restore best model: {e}")
+        return None
+
+
+# Integration helper for existing training scripts
+def setup_checkpoint_management(output_dir: Path,
+                                cleanup_frequency: int = 10) -> Dict[str, Any]:
+    """
+    Setup checkpoint management for training.
+
+    Args:
+        output_dir: Training output directory
+        cleanup_frequency: How often to clean up old checkpoints (epochs)
+
+    Returns:
+        Configuration for checkpoint management
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    config = {
+        'output_dir': output_dir,
+        'cleanup_frequency': cleanup_frequency,
+        'checkpoint_pattern': "checkpoint_epoch_*.pt",
+        'run_files_dir': output_dir / 'run_files'
+    }
+
+    # Create subdirectory for run files
+    config['run_files_dir'].mkdir(exist_ok=True)
+
+    logger.info(f"Checkpoint management setup complete: {output_dir}")
+    return config
 
 
 # Example usage

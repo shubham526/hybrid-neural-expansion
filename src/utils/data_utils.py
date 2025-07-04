@@ -140,3 +140,45 @@ class PairwiseExpansionDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.pairs[idx]
+
+
+# Add this to the END of src/utils/data_utils.py (after the existing classes)
+
+def expansion_collate_fn(batch):
+    """
+    Custom collate function for expansion dataset.
+
+    Args:
+        batch: List of examples from DocumentAwareExpansionDataset
+
+    Returns:
+        Batched data with proper handling of complex structures
+    """
+    return {
+        'query_id': [item['query_id'] for item in batch],
+        'query_text': [item['query_text'] for item in batch],
+        'expansion_features': [item['expansion_features'] for item in batch],
+        'doc_id': [item['doc_id'] for item in batch],
+        'doc_text': [item['doc_text'] for item in batch],
+        'first_stage_score': [item.get('first_stage_score', 0.0) for item in batch],
+        'relevance': [item['relevance'] for item in batch]
+    }
+
+
+def pairwise_collate_fn(batch):
+    """
+    Custom collate function for pairwise ranking dataset.
+
+    Args:
+        batch: List of examples from PairwiseExpansionDataset
+
+    Returns:
+        Batched pairwise data
+    """
+    return {
+        'query_id': [item['query_id'] for item in batch],
+        'query_text': [item['query_text'] for item in batch],
+        'expansion_features': [item['expansion_features'] for item in batch],
+        'positive_doc': [item['positive_doc'] for item in batch],
+        'negative_doc': [item['negative_doc'] for item in batch]
+    }
