@@ -392,6 +392,8 @@ def main():
                         help='Early stopping patience (epochs without improvement)')
     parser.add_argument('--disable-dev-eval', action='store_true',
                         help='Disable dev set evaluation (use original training)')
+    parser.add_argument('--rerank-top-k', type=int, default=100,
+                        help='Number of top documents to rerank during evaluation')
 
     parser.add_argument('--device', type=str, default=None,
                         help='Device (cuda/cpu)')
@@ -541,7 +543,8 @@ def main():
                 qrels=qrels,
                 output_dir=output_dir,
                 eval_metric=args.eval_metric,
-                patience=args.patience
+                patience=args.patience,
+                rerank_top_k=args.rerank_top_k  # NEW parameter
             )
 
         # Train model

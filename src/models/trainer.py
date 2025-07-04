@@ -39,7 +39,8 @@ class EvaluationAwareTrainer:
                  qrels: Optional[Dict[str, Dict[str, int]]] = None,
                  output_dir: Optional[Path] = None,
                  eval_metric: str = "ndcg_cut_20",
-                 patience: int = 5):
+                 patience: int = 5,
+                 rerank_top_k: int = 100):  # NEW parameter
         """
         Initialize trainer with evaluation capabilities.
 
@@ -57,6 +58,7 @@ class EvaluationAwareTrainer:
             output_dir: Directory to save run files and best model
             eval_metric: Metric to use for best model selection
             patience: Early stopping patience (epochs without improvement)
+            rerank_top_k: Number of top documents to rerank during evaluation
         """
         # Original trainer setup
         self.model = model
@@ -113,6 +115,7 @@ class EvaluationAwareTrainer:
         self.output_dir = Path(output_dir) if output_dir else None
         self.eval_metric = eval_metric
         self.patience = patience
+        self.rerank_top_k = rerank_top_k  # NEW
 
         # Best model tracking
         self.best_score = -1.0
@@ -138,6 +141,7 @@ class EvaluationAwareTrainer:
         logger.info(f"  Loss type: {loss_type}")
         logger.info(f"  Evaluation metric: {eval_metric}")
         logger.info(f"  Early stopping patience: {patience}")
+        logger.info(f"  Rerank top-k: {rerank_top_k}")  # NEW
 
     def evaluate_on_dev_set(self, val_dataset: Dataset, epoch: int) -> Tuple[float, Dict[str, List[Tuple[str, float]]]]:
         """
@@ -165,7 +169,7 @@ class EvaluationAwareTrainer:
         from src.utils.data_utils import expansion_collate_fn
 
         # Extract data from validation dataset
-        dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=expansion_collate_fn)
+        dataloader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, collate_fn=expansion_collate_fn)
 
         for batch in dataloader:
             # Since batch_size=1, each batch has one example
@@ -244,12 +248,12 @@ class EvaluationAwareTrainer:
                         expansion_features=expansion_features,
                         candidates=candidates,
                         document_texts=document_texts,
-                        top_k=100
+                        top_k=self.rerank_top_k  # Use configurable top-k
                     )
                     reranked_results[query_id] = reranked
                 except Exception as e:
                     logger.warning(f"Error reranking query {query_id}: {e}")
-                    reranked_results[query_id] = candidates[:100]
+                    reranked_results[query_id] = candidates[:self.rerank_top_k]  # Use configurable top-k
 
         return reranked_results
 
