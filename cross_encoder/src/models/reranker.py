@@ -30,7 +30,8 @@ class ConfigurableNeuralReranker(nn.Module):
                  scoring_method: str = "neural",  # "neural", "cosine", or "bilinear"
                  device: str = None,
                  force_hf: bool = False,  # NEW parameter
-                 pooling_strategy: str = 'cls'
+                 pooling_strategy: str = 'cls',
+                 ablation_mode: str = "both"
     ):
         super().__init__()
 
@@ -40,6 +41,14 @@ class ConfigurableNeuralReranker(nn.Module):
         self.scoring_method = scoring_method  # NEW
         self.force_hf = force_hf  # NEW
         self.pooling_strategy = pooling_strategy  # NEW
+
+        self.ablation_mode = ablation_mode  # ADD THIS LINE after other assignments
+
+        # Add validation
+        if ablation_mode not in ["both", "rm3_only", "cosine_only"]:
+            raise ValueError(f"Invalid ablation_mode: {ablation_mode}. Must be 'both', 'rm3_only', or 'cosine_only'")
+
+        logger.info(f"Ablation mode: {ablation_mode}")  # ADD THIS LINE
 
         # Determine device FIRST
         if device is None:
@@ -230,8 +239,21 @@ class ConfigurableNeuralReranker(nn.Module):
                     dtype=torch.float32
                 )
 
-                # Compute importance weight (all tensors on same device)
-                importance = self.alpha * rm_weight + self.beta * semantic_score
+                # Compute importance weight based on ablation mode
+                if self.ablation_mode == "rm3_only":
+                    # Use only RM3 component
+                    importance = self.alpha * rm_weight
+                elif self.ablation_mode == "cosine_only":
+                    # Use only cosine similarity component
+                    importance = self.beta * semantic_score
+                else:  # self.ablation_mode == "both"
+                    # Use both components (original behavior)
+                    importance = self.alpha * rm_weight + self.beta * semantic_score
+
+                # In reranker.py, after computing importance:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"Ablation: {self.ablation_mode}, RM3: {rm_weight.item():.4f}, "
+                                 f"Semantic: {semantic_score.item():.4f}, Final: {importance.item():.4f}")
 
                 # Weight the term embedding
                 term_emb = term_embeddings[i]  # Already on correct device
@@ -453,7 +475,8 @@ class ConfigurableNeuralReranker(nn.Module):
 def create_neural_reranker(model_name: str = 'all-MiniLM-L6-v2',
                            scoring_method: str = "neural",
                            force_hf: bool = False,  # NEW parameter
-                           pooling_strategy: str = 'cls',  # NEW parameter
+                           pooling_strategy: str = 'cls',
+                           ablation_mode: str = "both", # NEW parameter
                            **kwargs) -> ConfigurableNeuralReranker:
     """
     Factory function to create neural reranker with configurable scoring.
@@ -473,6 +496,7 @@ def create_neural_reranker(model_name: str = 'all-MiniLM-L6-v2',
         scoring_method=scoring_method,
         force_hf=force_hf,
         pooling_strategy=pooling_strategy,
+        ablation_mode=ablation_mode,
         **kwargs
     )
 

@@ -326,6 +326,7 @@ def main():
             pooling_strategy = args.pooling_strategy if hasattr(args,
                                                                 'pooling_strategy') and args.pooling_strategy else model_info.get(
                 'pooling_strategy', 'cls')
+            ablation_mode = model_info.get('ablation_mode', 'both')
 
             reranker = create_neural_reranker(
                 model_name=model_info['model_name'],
@@ -334,10 +335,16 @@ def main():
                 dropout=model_info.get('dropout', 0.1),
                 scoring_method=model_info.get('scoring_method', 'neural'),
                 force_hf=force_hf,
-                pooling_strategy=pooling_strategy
+                pooling_strategy=pooling_strategy,
+                ablation_mode=ablation_mode
             )
 
-            logger.info(f"Model configuration: force_hf={force_hf}, pooling={pooling_strategy}")
+            logger.info(
+                f"Model configuration: force_hf={force_hf}, pooling={pooling_strategy}, ablation={ablation_mode}")  # UPDATE THIS LINE
+            # In evaluate.py, after loading model
+            logger.info(f"Ablation mode: {ablation_mode}")
+            if ablation_mode != "both":
+                logger.info(f"Running ablation - using {ablation_mode.replace('_', ' ')} component only")
 
             # Load trained weights - try multiple possible paths
             model_paths = [

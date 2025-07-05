@@ -346,6 +346,10 @@ def main():
                         help='Dataset name for loading documents (optional)')
     parser.add_argument('--output-dir', type=str, required=True,
                         help='Output directory for trained model and evaluation results')
+    # Add this with other model arguments
+    parser.add_argument('--ablation-mode', type=str, default='both',
+                        choices=['both', 'rm3_only', 'cosine_only'],
+                        help='Ablation mode: both components, RM3 only, or cosine similarity only')
 
 
     # Model arguments
@@ -530,7 +534,8 @@ def main():
                 scoring_method=args.scoring_method,
                 device=args.device,
                 force_hf=args.force_hf,  # NEW parameter
-                pooling_strategy=args.pooling_strategy  # NEW parameter
+                pooling_strategy=args.pooling_strategy,  # NEW parameter
+                ablation_mode=args.ablation_mode
             )
             if torch.cuda.is_available():
                 device = torch.device(f'cuda:{torch.cuda.current_device()}')
@@ -579,6 +584,7 @@ def main():
             # Create comprehensive model info
             model_info = {
                 'model_name': args.model_name,
+                'ablation_mode': args.ablation_mode,
                 'force_hf': args.force_hf,  # NEW
                 'pooling_strategy': args.pooling_strategy,  # NEW
                 'max_expansion_terms': args.max_expansion_terms,
