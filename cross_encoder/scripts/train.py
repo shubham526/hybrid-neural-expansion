@@ -18,10 +18,9 @@ from pathlib import Path
 from typing import Dict, List, Any
 from collections import defaultdict
 
-# Add project root to path
-project_root = Path(__file__).resolve().parent.parent
+# Add the project's root directory to the Python path
+project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(project_root))
-
 import ir_datasets
 
 from cross_encoder.src.models.reranker import create_neural_reranker

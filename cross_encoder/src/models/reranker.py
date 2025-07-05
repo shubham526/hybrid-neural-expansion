@@ -149,7 +149,7 @@ class ConfigurableNeuralReranker(nn.Module):
 
         # Convert numpy to torch tensor if needed
         if isinstance(embedding, np.ndarray):
-            embedding = torch.from_numpy(embedding)
+            embedding = torch.from_numpy(embedding).requires_grad_(True)
 
         embedding = embedding.to(self.device, dtype=torch.float32)
         return embedding
@@ -164,9 +164,9 @@ class ConfigurableNeuralReranker(nn.Module):
 
         # Convert numpy to torch tensor if needed
         if isinstance(embeddings, np.ndarray):
-            embeddings = torch.from_numpy(embeddings)
+            embeddings = torch.from_numpy(embeddings).requires_grad_(True)
         elif isinstance(embeddings, list):
-            embeddings = torch.from_numpy(np.array(embeddings))
+            embeddings = torch.from_numpy(np.array(embeddings)).requires_grad_(True)
 
         embeddings = embeddings.to(self.device, dtype=torch.float32)
         return embeddings
