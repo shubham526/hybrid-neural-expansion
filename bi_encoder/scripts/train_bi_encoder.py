@@ -29,12 +29,12 @@ Usage:
 
 import argparse
 import json
-import logging
 import sys
 import torch
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from collections import defaultdict
+import logging
 
 # Add project root to path
 project_root = Path(__file__).resolve().parent.parent
@@ -633,7 +633,7 @@ def main():
     # Load configuration
     if args.config:
         config = load_config_file(Path(args.config))
-        logger.info(f"Loaded configuration from: {args.config}")
+        print(f"Loaded configuration from: {args.config}")
     else:
         config = create_config_from_args(args)
 
