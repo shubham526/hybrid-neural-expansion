@@ -16,6 +16,7 @@ import json
 import h5py
 from tqdm import tqdm
 import gc
+from bi_encoder.src.models.similarity import SimilarityComputer, create_similarity_computer
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class EmbeddingManager:
                  embedding_dim: int,
                  storage_format: str = 'hdf5',
                  normalize_embeddings: bool = True,
+                 similarity_type: str = 'cosine',
                  device: str = None):
         """
         Initialize embedding manager.
@@ -39,6 +41,7 @@ class EmbeddingManager:
             embedding_dim: Dimension of embeddings
             storage_format: Storage format ('hdf5', 'numpy', 'pickle')
             normalize_embeddings: Whether to L2 normalize embeddings
+            similarity_type: Type of similarity function to use
             device: Device for tensor operations
         """
         self.embedding_dim = embedding_dim
@@ -54,11 +57,103 @@ class EmbeddingManager:
         self.embeddings = {}
         self.metadata = {}
 
+        # Initialize similarity computer with error handling
+        try:
+            self.similarity_computer = create_similarity_computer(
+                similarity_type=similarity_type,
+                embedding_dim=embedding_dim
+            )
+            # Move to device if it supports it
+            if hasattr(self.similarity_computer, 'to'):
+                self.similarity_computer = self.similarity_computer.to(self.device)
+        except Exception as e:
+            logger.warning(f"Failed to create similarity computer: {e}")
+            logger.warning("Falling back to basic cosine similarity")
+            self.similarity_computer = None
+            self.similarity_type = similarity_type
+
         logger.info(f"EmbeddingManager initialized:")
         logger.info(f"  Embedding dim: {embedding_dim}")
         logger.info(f"  Storage format: {storage_format}")
         logger.info(f"  Normalize: {normalize_embeddings}")
+        logger.info(f"  Similarity type: {similarity_type}")
         logger.info(f"  Device: {self.device}")
+
+    def compute_similarities(self,
+                             query_embeddings: torch.Tensor,
+                             doc_embeddings: torch.Tensor) -> torch.Tensor:
+        """Compute similarities using the centralized similarity computer."""
+        if self.similarity_computer is not None:
+            # Ensure tensors are on the right device
+            query_embeddings = query_embeddings.to(self.device)
+            doc_embeddings = doc_embeddings.to(self.device)
+
+            # Use row-by-row computation
+            similarities = []
+            for i in range(query_embeddings.size(0)):
+                query_emb = query_embeddings[i]
+                sim_scores = self.similarity_computer.compute_similarity(query_emb, doc_embeddings)
+                similarities.append(sim_scores)
+
+            return torch.stack(similarities)
+        else:
+            # Fallback to simple cosine similarity
+            logger.debug("Using fallback cosine similarity")
+            query_norm = F.normalize(query_embeddings, p=2, dim=1)
+            doc_norm = F.normalize(doc_embeddings, p=2, dim=1)
+            return torch.matmul(query_norm, doc_norm.t())
+
+    def search_similar(self,
+                       query_embedding: torch.Tensor,
+                       document_embeddings: torch.Tensor,
+                       top_k: int = 10) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Search for most similar documents."""
+        # Input validation
+        if query_embedding.dim() != 1:
+            raise ValueError(f"Query embedding must be 1D, got {query_embedding.dim()}D")
+        if document_embeddings.dim() != 2:
+            raise ValueError(f"Document embeddings must be 2D, got {document_embeddings.dim()}D")
+
+        # Ensure same device
+        query_embedding = query_embedding.to(self.device)
+        document_embeddings = document_embeddings.to(self.device)
+
+        if self.similarity_computer is not None:
+            similarities = self.similarity_computer.compute_similarity(
+                query_embedding, document_embeddings
+            )
+        else:
+            # Fallback computation
+            query_norm = F.normalize(query_embedding.unsqueeze(0), p=2, dim=1)
+            doc_norm = F.normalize(document_embeddings, p=2, dim=1)
+            similarities = torch.matmul(query_norm, doc_norm.t()).squeeze(0)
+
+        # Handle edge case where top_k > num_documents
+        actual_k = min(top_k, len(similarities))
+        top_scores, top_indices = torch.topk(similarities, actual_k)
+        return top_scores, top_indices
+
+    def set_similarity_type(self, similarity_type: str):
+        """Change the similarity computation method."""
+        try:
+            self.similarity_computer = create_similarity_computer(
+                similarity_type=similarity_type,
+                embedding_dim=self.embedding_dim
+            )
+            if hasattr(self.similarity_computer, 'to'):
+                self.similarity_computer = self.similarity_computer.to(self.device)
+
+            logger.info(f"Similarity type changed to: {similarity_type}")
+        except Exception as e:
+            logger.error(f"Failed to change similarity type: {e}")
+            raise
+
+    def get_similarity_type(self) -> str:
+        """Get current similarity computation method."""
+        if self.similarity_computer is not None:
+            return self.similarity_computer.similarity_function.value
+        else:
+            return getattr(self, 'similarity_type', 'cosine')
 
     def compute_embeddings(self,
                            texts: List[str],
@@ -419,32 +514,68 @@ def compute_similarity_matrix(query_embeddings: torch.Tensor,
                               doc_embeddings: torch.Tensor,
                               similarity_type: str = 'cosine') -> torch.Tensor:
     """
-    Compute similarity matrix between queries and documents.
+    Compute similarity matrix using the centralized similarity components.
 
     Args:
         query_embeddings: [num_queries, embedding_dim]
         doc_embeddings: [num_docs, embedding_dim]
-        similarity_type: Type of similarity ('cosine', 'dot', 'euclidean')
+        similarity_type: Type of similarity ('cosine', 'dot_product', 'learned', etc.)
 
     Returns:
         Similarity matrix [num_queries, num_docs]
     """
-    if similarity_type == 'cosine':
-        # Normalize and compute dot product
-        query_norm = F.normalize(query_embeddings, p=2, dim=1)
-        doc_norm = F.normalize(doc_embeddings, p=2, dim=1)
-        return torch.matmul(query_norm, doc_norm.t())
+    # Use the centralized similarity computer
+    similarity_computer = create_similarity_computer(
+        similarity_type=similarity_type,
+        embedding_dim=query_embeddings.size(-1)
+    )
 
-    elif similarity_type == 'dot':
-        return torch.matmul(query_embeddings, doc_embeddings.t())
+    # Compute row by row using the standardized similarity functions
+    similarities = []
+    for i in range(query_embeddings.size(0)):
+        query_emb = query_embeddings[i]
+        sim_scores = similarity_computer.compute_similarity(query_emb, doc_embeddings)
+        similarities.append(sim_scores)
 
-    elif similarity_type == 'euclidean':
-        # Negative euclidean distance (higher = more similar)
-        distances = torch.cdist(query_embeddings, doc_embeddings, p=2)
-        return -distances
+    return torch.stack(similarities)
 
-    else:
-        raise ValueError(f"Unknown similarity type: {similarity_type}")
+
+def batch_compute_similarities(query_embeddings: torch.Tensor,
+                               doc_embeddings: torch.Tensor,
+                               similarity_type: str = 'cosine',
+                               batch_size: int = 1000) -> torch.Tensor:
+    """
+    Compute similarities in batches to handle large matrices.
+
+    Args:
+        query_embeddings: [num_queries, embedding_dim]
+        doc_embeddings: [num_docs, embedding_dim]
+        similarity_type: Type of similarity function
+        batch_size: Batch size for processing queries
+
+    Returns:
+        Similarity matrix [num_queries, num_docs]
+    """
+    num_queries = query_embeddings.size(0)
+    all_similarities = []
+
+    similarity_computer = create_similarity_computer(
+        similarity_type=similarity_type,
+        embedding_dim=query_embeddings.size(-1)
+    )
+
+    for i in range(0, num_queries, batch_size):
+        batch_queries = query_embeddings[i:i + batch_size]
+        batch_similarities = []
+
+        for j in range(batch_queries.size(0)):
+            query_emb = batch_queries[j]
+            sim_scores = similarity_computer.compute_similarity(query_emb, doc_embeddings)
+            batch_similarities.append(sim_scores)
+
+        all_similarities.append(torch.stack(batch_similarities))
+
+    return torch.cat(all_similarities, dim=0)
 
 
 def batch_encode_texts(texts: List[str],
@@ -499,12 +630,14 @@ def batch_encode_texts(texts: List[str],
 def create_embedding_manager(embedding_dim: int,
                              storage_format: str = 'hdf5',
                              normalize: bool = True,
+                             similarity_type: str = 'cosine',
                              device: str = None) -> EmbeddingManager:
     """Factory function to create embedding manager."""
     return EmbeddingManager(
         embedding_dim=embedding_dim,
         storage_format=storage_format,
         normalize_embeddings=normalize,
+        similarity_type=similarity_type,
         device=device
     )
 
@@ -516,7 +649,7 @@ if __name__ == "__main__":
     print("Testing embedding utilities...")
 
     # Test embedding manager
-    manager = create_embedding_manager(embedding_dim=384)
+    manager = create_embedding_manager(embedding_dim=384, similarity_type='cosine')
 
     # Create dummy embeddings
     dummy_embeddings = torch.randn(100, 384)
@@ -543,5 +676,15 @@ if __name__ == "__main__":
     sim_matrix = compute_similarity_matrix(query_embs, doc_embs, 'cosine')
     print(f"Similarity matrix shape: {sim_matrix.shape}")
     print(f"Similarity range: [{sim_matrix.min():.3f}, {sim_matrix.max():.3f}]")
+
+    # Test EmbeddingManager similarity methods
+    manager_sim_matrix = manager.compute_similarities(query_embs, doc_embs)
+    print(f"Manager similarity matrix shape: {manager_sim_matrix.shape}")
+
+    # Test search functionality
+    query_emb = torch.randn(384)
+    top_scores, top_indices = manager.search_similar(query_emb, doc_embs, top_k=3)
+    print(f"Top 3 similarities: {top_scores}")
+    print(f"Top 3 indices: {top_indices}")
 
     print("Embedding utilities test completed!")
