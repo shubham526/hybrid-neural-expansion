@@ -14,7 +14,8 @@ from pathlib import Path
 from collections import defaultdict
 
 # Add project root to path
-project_root = Path(__file__).resolve().parent.parent
+# Add the project's root directory to the Python path
+project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 import ir_datasets

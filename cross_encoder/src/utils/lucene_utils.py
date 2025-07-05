@@ -32,6 +32,7 @@ def get_lucene_classes():
                 'Term': autoclass('org.apache.lucene.index.Term'),
                 'TermQuery': autoclass('org.apache.lucene.search.TermQuery'),
                 'BooleanQuery': autoclass('org.apache.lucene.search.BooleanQuery'),
+                'BoostQuery': autoclass('org.apache.lucene.search.BoostQuery'),
                 'BooleanQueryBuilder': autoclass('org.apache.lucene.search.BooleanQuery$Builder'),
                 'BooleanClause': autoclass('org.apache.lucene.search.BooleanClause'),
                 'BooleanClauseOccur': autoclass('org.apache.lucene.search.BooleanClause$Occur'),
@@ -70,7 +71,8 @@ def initialize_lucene(lucene_path: str) -> bool:
             'lucene-core-10.1.0.jar',
             'lucene-analysis-common-10.1.0.jar',
             'lucene-queryparser-10.1.0.jar',
-            'lucene-memory-10.1.0.jar'
+            'lucene-memory-10.1.0.jar',
+            'lucene-backward-codecs-10.1.0.jar'
         ]
 
         jar_paths = []

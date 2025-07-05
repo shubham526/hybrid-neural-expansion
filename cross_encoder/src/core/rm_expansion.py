@@ -18,6 +18,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 import numpy as np
 from scipy.special import logsumexp
+import json
 
 from cross_encoder.src.utils.lucene_utils import get_lucene_classes
 
@@ -121,8 +122,18 @@ class LuceneRM3Scorer:
         for score_doc, doc_weight in zip(score_docs, doc_weights):
             doc = self.searcher.storedFields().document(score_doc.doc)
             doc_content = doc.get("contents")
+            doc_id = doc.get("id") or "unknown_id"
             if not doc_content:
-                continue
+                # Fallback: Try to extract from 'raw' (for Pyserini prebuilt indexes)
+                raw_json = doc.get("raw")
+                if raw_json:
+                    try:
+                        parsed = json.loads(raw_json)
+                        doc_content = parsed.get("contents", "")
+                    except json.JSONDecodeError:
+                        logger.warning(f"Document {doc_id}: Missing 'contents' field—attempted to extract from 'raw'.")
+                        logger.warning(f"Document {doc_id}: Failed to parse 'raw' field as JSON—skipping document.")
+                        continue  # Skip this document safely
 
             term_freqs, doc_len = self._get_term_freqs_and_build_map(doc_content, original_term_counts)
             if doc_len == 0:

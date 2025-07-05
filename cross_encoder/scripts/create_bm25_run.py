@@ -16,7 +16,14 @@ import argparse
 import os
 import sys
 import logging
+from pathlib import Path
+
+# Add the project's root directory to the Python path
+project_root = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(project_root))
+
 from cross_encoder.src.utils.lucene_utils import initialize_lucene, get_lucene_classes
+
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +102,7 @@ class TrecBM25Runner:
             results = []
             for score_doc in doc_hits.scoreDocs:
                 # Get the document
-                document = self.searcher.doc(score_doc.doc)
+                document = self.searcher.storedFields().document(score_doc.doc)
                 collection_doc_id = document.get('id')
                 # If no collection ID found, use Lucene internal ID as fallback
                 if not collection_doc_id:
@@ -224,7 +231,8 @@ def main():
     runner = TrecBM25Runner(
         index_path=args.index_path,
         search_field=args.search_field,
-        analyzer_type=args.analyzer
+        analyzer_type=args.analyzer,
+        lucene_path=args.lucene_path
     )
 
     try:
