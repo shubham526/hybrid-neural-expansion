@@ -7,7 +7,7 @@ Avoids the overhead of creating temporary files for each evaluation.
 
 import logging
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 import pytrec_eval
 
 logger = logging.getLogger(__name__)
@@ -207,7 +207,7 @@ def add_fast_evaluation_to_trec_evaluator():
     Monkey patch to add fast evaluation to existing TRECEvaluator.
     This maintains compatibility with existing code.
     """
-    from src.evaluation.evaluator import TRECEvaluator
+    from cross_encoder.src.evaluation.evaluator import TRECEvaluator
 
     def evaluate_single_metric_fast(self, run_results: Dict[str, List[Tuple[str, float]]],
                                     qrels: Dict[str, Dict[str, int]],

@@ -24,11 +24,11 @@ sys.path.insert(0, str(project_root))
 
 import ir_datasets
 
-from src.models.reranker import create_neural_reranker
-from src.models.trainer import EvaluationAwareTrainer
-from src.utils.file_utils import save_json, ensure_dir
-from src.utils.logging_utils import setup_experiment_logging, log_experiment_info, TimedOperation
-from src.utils.data_utils import DocumentAwareExpansionDataset, PairwiseExpansionDataset, expansion_collate_fn
+from cross_encoder.src.models.reranker import create_neural_reranker
+from cross_encoder.src.models.trainer import EvaluationAwareTrainer
+from cross_encoder.src.utils.file_utils import save_json, ensure_dir
+from cross_encoder.src.utils.logging_utils import setup_experiment_logging, log_experiment_info, TimedOperation
+from cross_encoder.src.utils.data_utils import DocumentAwareExpansionDataset, PairwiseExpansionDataset
 
 logger = logging.getLogger(__name__)
 

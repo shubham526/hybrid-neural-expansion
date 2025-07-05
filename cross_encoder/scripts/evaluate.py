@@ -12,7 +12,6 @@ import sys
 import torch
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
-from collections import defaultdict
 
 # Add project root to path
 project_root = Path(__file__).resolve().parent.parent
@@ -21,10 +20,10 @@ sys.path.insert(0, str(project_root))
 import ir_datasets
 from tqdm import tqdm
 
-from src.models.reranker import create_neural_reranker
-from src.evaluation.evaluator import TRECEvaluator
-from src.utils.file_utils import load_json, save_json, save_trec_run, ensure_dir
-from src.utils.logging_utils import setup_experiment_logging, log_experiment_info, TimedOperation
+from cross_encoder.src.models.reranker import create_neural_reranker
+from cross_encoder.src.evaluation.evaluator import TRECEvaluator
+from cross_encoder.src.utils.file_utils import load_json, save_json, save_trec_run, ensure_dir
+from cross_encoder.src.utils.logging_utils import setup_experiment_logging, log_experiment_info, TimedOperation
 
 logger = logging.getLogger(__name__)
 

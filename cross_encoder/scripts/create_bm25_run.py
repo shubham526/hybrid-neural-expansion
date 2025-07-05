@@ -15,9 +15,8 @@ TREC Run File Format:
 import argparse
 import os
 import sys
-from jnius import autoclass
 import logging
-from src.utils.lucene_utils import initialize_lucene, get_lucene_classes
+from cross_encoder.src.utils.lucene_utils import initialize_lucene, get_lucene_classes
 
 logger = logging.getLogger(__name__)
 

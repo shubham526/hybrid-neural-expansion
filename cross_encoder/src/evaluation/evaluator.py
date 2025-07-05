@@ -1,10 +1,10 @@
 import logging
 import tempfile
 import os
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any
 from collections import defaultdict
 import ir_datasets
-from src.evaluation.metrics import get_metric
+from cross_encoder.src.evaluation.metrics import get_metric
 
 logger = logging.getLogger(__name__)
 
@@ -453,8 +453,8 @@ def run_paper_evaluation_example():
 
     try:
         # This is just an example - adapt to your actual pipeline
-        from src.models.multivector_reranking import TRECDLReranker
-        from src.models.expansion_models import create_baseline_comparison_models
+        from cross_encoder.src import TRECDLReranker
+        from cross_encoder.src import create_baseline_comparison_models
 
         # Load TREC DL data
         evaluator = create_trec_dl_evaluator("2019")

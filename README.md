@@ -66,7 +66,7 @@ First, create a Lucene index for your dataset:
 ```python
 # You'll need to implement index creation for your specific collection
 # Example structure:
-from src.utils.lucene_utils import initialize_lucene
+from cross_encoder.src.utils.lucene_utils import initialize_lucene
 
 initialize_lucene("./lucene-jars")
 # Index creation code here...
@@ -237,9 +237,9 @@ Typical improvements over BM25 baseline on TREC DL:
 ### Custom Feature Extraction
 
 ```python
-from src.core.feature_extractor import ExpansionFeatureExtractor
-from src.core.rm_expansion import RMExpansion
-from src.core.semantic_similarity import SemanticSimilarity
+from cross_encoder.src.core.feature_extractor import ExpansionFeatureExtractor
+from cross_encoder.src.core.rm_expansion import RMExpansion
+from cross_encoder.src.core.semantic_similarity import SemanticSimilarity
 
 # Initialize components
 rm_expansion = RMExpansion(index_path)
@@ -263,7 +263,7 @@ features = extractor.extract_features_for_query(
 ### Custom Neural Architecture
 
 ```python
-from src.models.reranker import ImportanceWeightedNeuralReranker
+from cross_encoder.src.models.reranker import ImportanceWeightedNeuralReranker
 
 # Create custom reranker
 reranker = ImportanceWeightedNeuralReranker(
@@ -281,7 +281,7 @@ print(f"α={alpha:.3f}, β={beta:.3f}")
 ### Batch Evaluation
 
 ```python
-from src.evaluation.evaluator import TRECEvaluator
+from cross_encoder.src.evaluation.evaluator import TRECEvaluator
 
 evaluator = TRECEvaluator(metrics=['map', 'ndcg_cut_10'])
 

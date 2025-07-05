@@ -15,7 +15,7 @@ import logging
 import sys
 import random
 from pathlib import Path
-from typing import Dict, List, Any, Set, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple
 from collections import defaultdict
 
 # Add project root to path
@@ -25,8 +25,8 @@ sys.path.insert(0, str(project_root))
 import ir_datasets
 from tqdm import tqdm
 
-from src.utils.file_utils import load_json, save_json, load_trec_run, ensure_dir, load_features_file
-from src.utils.logging_utils import setup_experiment_logging, log_experiment_info, TimedOperation
+from cross_encoder.src.utils.file_utils import load_json, save_json, load_trec_run, ensure_dir, load_features_file
+from cross_encoder.src.utils.logging_utils import setup_experiment_logging, log_experiment_info, TimedOperation
 
 logger = logging.getLogger(__name__)
 

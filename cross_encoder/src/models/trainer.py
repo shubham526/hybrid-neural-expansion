@@ -14,8 +14,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from typing import Dict, List, Tuple, Any, Optional
-import numpy as np
+from typing import Dict, List, Tuple, Optional
 from tqdm import tqdm
 from pathlib import Path
 
@@ -128,7 +127,7 @@ class EvaluationAwareTrainer:
         # Setup evaluator if evaluation data provided
         self.evaluator = None
         if self.queries and self.qrels:
-            from src.evaluation.evaluator import TRECEvaluator
+            from cross_encoder.src.evaluation.evaluator import TRECEvaluator
             self.evaluator = TRECEvaluator(metrics=[eval_metric])
             logger.info(f"Evaluation setup complete - using {eval_metric} for best model selection")
         else:
@@ -178,7 +177,7 @@ class EvaluationAwareTrainer:
         first_stage_runs = {}
 
         # Import collate function
-        from src.utils.data_utils import expansion_collate_fn
+        from cross_encoder.src.utils.data_utils import expansion_collate_fn
 
         # Extract data from validation dataset
         dataloader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, collate_fn=expansion_collate_fn)
@@ -328,7 +327,7 @@ class EvaluationAwareTrainer:
         self.model.train()
 
         # Import collate function
-        from src.utils.data_utils import expansion_collate_fn
+        from cross_encoder.src.utils.data_utils import expansion_collate_fn
 
         dataloader = DataLoader(
             dataset,
@@ -633,7 +632,7 @@ class EvaluationAwareTrainer:
         num_examples = 0
 
         # Import collate function
-        from src.utils.data_utils import expansion_collate_fn
+        from cross_encoder.src.utils.data_utils import expansion_collate_fn
 
         with torch.no_grad():
             dataloader = DataLoader(

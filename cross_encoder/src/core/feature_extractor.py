@@ -7,10 +7,10 @@ Extracts the two core features needed for learning:
 """
 
 import logging
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Optional
 
-from src.core.rm_expansion import RMExpansion
-from src.core.semantic_similarity import SemanticSimilarity
+from cross_encoder.src.core.rm_expansion import RMExpansion
+from cross_encoder.src.core.semantic_similarity import SemanticSimilarity
 
 logger = logging.getLogger(__name__)
 

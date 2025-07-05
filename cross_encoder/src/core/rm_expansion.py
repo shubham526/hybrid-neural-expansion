@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 from scipy.special import logsumexp
 
-from src.utils.lucene_utils import get_lucene_classes
+from cross_encoder.src.utils.lucene_utils import get_lucene_classes
 
 logger = logging.getLogger(__name__)
 

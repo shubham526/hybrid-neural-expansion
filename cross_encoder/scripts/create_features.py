@@ -12,7 +12,6 @@ import logging
 import sys
 import json
 from pathlib import Path
-from typing import Dict, Any
 
 # Add project root to path
 project_root = Path(__file__).resolve().parent.parent
@@ -21,9 +20,9 @@ sys.path.insert(0, str(project_root))
 import ir_datasets
 from tqdm import tqdm
 
-from src.core.feature_extractor import ExpansionFeatureExtractor
-from src.utils.file_utils import save_json, ensure_dir
-from src.utils.logging_utils import setup_experiment_logging, log_experiment_info, TimedOperation
+from cross_encoder.src.core.feature_extractor import ExpansionFeatureExtractor
+from cross_encoder.src.utils.file_utils import ensure_dir
+from cross_encoder.src.utils.logging_utils import setup_experiment_logging, log_experiment_info, TimedOperation
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +85,7 @@ def main():
     try:
         # Initialize components
         with TimedOperation(logger, "Initializing RM3 and semantic similarity components"):
-            from src.utils.lucene_utils import initialize_lucene
+            from cross_encoder.src.utils.lucene_utils import initialize_lucene
             if not initialize_lucene(args.lucene_path):
                 raise RuntimeError("Failed to initialize Lucene")
 

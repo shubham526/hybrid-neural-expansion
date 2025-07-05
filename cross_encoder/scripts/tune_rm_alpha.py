@@ -10,7 +10,6 @@ relying on the rm_expansion module only for generating expansion terms.
 import argparse
 import logging
 import sys
-import json
 from pathlib import Path
 from collections import defaultdict
 
@@ -22,10 +21,10 @@ import ir_datasets
 from tqdm import tqdm
 import pytrec_eval
 
-from src.core.rm_expansion import RMExpansion
-from scripts.create_train_test_data import get_query_text
-from src.utils.logging_utils import setup_experiment_logging, log_experiment_info, TimedOperation
-from src.utils.lucene_utils import initialize_lucene, get_lucene_classes
+from cross_encoder.src.core.rm_expansion import RMExpansion
+from cross_encoder.scripts.create_train_test_data import get_query_text
+from cross_encoder.src.utils.logging_utils import setup_experiment_logging, log_experiment_info, TimedOperation
+from cross_encoder.src.utils.lucene_utils import initialize_lucene, get_lucene_classes
 
 logger = logging.getLogger(__name__)
 

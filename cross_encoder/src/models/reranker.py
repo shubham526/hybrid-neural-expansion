@@ -11,8 +11,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Dict, List, Tuple, Optional
-from src.core.semantic_similarity import SemanticSimilarity
+from typing import Dict, List, Tuple
+from cross_encoder.src.core.semantic_similarity import SemanticSimilarity
 
 logger = logging.getLogger(__name__)
 
