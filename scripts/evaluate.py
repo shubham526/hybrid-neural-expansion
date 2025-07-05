@@ -226,6 +226,11 @@ def main():
                         help='Output directory for evaluation results')
     parser.add_argument('--query-ids-file', type=str,
                         help='File with query IDs to evaluate (optional)')
+    # Add these with other model arguments (around line 155):
+    parser.add_argument('--force-hf', action='store_true',
+                        help='Force using HuggingFace transformers (overrides model_info.json)')
+    parser.add_argument('--pooling-strategy', choices=['cls', 'mean', 'max'],
+                        help='Pooling strategy for HuggingFace models (overrides model_info.json)')
 
     # Evaluation arguments
     parser.add_argument('--run-baselines', action='store_true',
@@ -314,21 +319,44 @@ def main():
             document_loader = DocumentLoader(dataset)
 
         # Load trained model
+        # Load trained model
         with TimedOperation(logger, "Loading trained neural reranker"):
+            # Use CLI args if provided, otherwise fall back to model_info
+            force_hf = args.force_hf if hasattr(args, 'force_hf') and args.force_hf else model_info.get('force_hf',
+                                                                                                        False)
+            pooling_strategy = args.pooling_strategy if hasattr(args,
+                                                                'pooling_strategy') and args.pooling_strategy else model_info.get(
+                'pooling_strategy', 'cls')
+
             reranker = create_neural_reranker(
                 model_name=model_info['model_name'],
                 max_expansion_terms=model_info['max_expansion_terms'],
                 hidden_dim=model_info['hidden_dim'],
-                dropout=model_info.get('dropout', 0.1)
+                dropout=model_info.get('dropout', 0.1),
+                scoring_method=model_info.get('scoring_method', 'neural'),
+                force_hf=force_hf,
+                pooling_strategy=pooling_strategy
             )
 
-            # Load trained weights
-            model_path = Path(args.model_info_file).parent / 'neural_reranker.pt'
-            if model_path.exists():
-                reranker.load_state_dict(torch.load(model_path, map_location=reranker.device))
-                logger.info(f"Loaded trained model from: {model_path}")
-            else:
-                logger.warning(f"Model file not found: {model_path}")
+            logger.info(f"Model configuration: force_hf={force_hf}, pooling={pooling_strategy}")
+
+            # Load trained weights - try multiple possible paths
+            model_paths = [
+                Path(args.model_info_file).parent / 'best_model.pt',
+                Path(args.model_info_file).parent / 'final_model.pt',
+                Path(args.model_info_file).parent / 'neural_reranker.pt'
+            ]
+
+            model_loaded = False
+            for model_path in model_paths:
+                if model_path.exists():
+                    reranker.load_state_dict(torch.load(model_path, map_location=reranker.device))
+                    logger.info(f"Loaded trained model from: {model_path}")
+                    model_loaded = True
+                    break
+
+            if not model_loaded:
+                logger.warning("No trained model file found!")
                 logger.warning("Using randomly initialized weights!")
 
             # Verify learned weights

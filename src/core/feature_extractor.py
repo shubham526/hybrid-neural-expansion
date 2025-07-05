@@ -32,7 +32,10 @@ class ExpansionFeatureExtractor:
             b=self.config.get('b', 0.75)
         )
 
-        self.semantic_sim = SemanticSimilarity(config.get('embedding_model'))
+        self.semantic_sim = SemanticSimilarity(
+            model_name=config.get('embedding_model'),
+            force_hf=config.get('force_hf', False)  # Add this parameter
+        )
         logger.info("ExpansionFeatureExtractor initialized.")
 
     def extract_features_for_query(self,

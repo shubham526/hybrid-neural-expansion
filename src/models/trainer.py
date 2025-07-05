@@ -143,6 +143,18 @@ class EvaluationAwareTrainer:
         logger.info(f"  Early stopping patience: {patience}")
         logger.info(f"  Rerank top-k: {rerank_top_k}")  # NEW
 
+        # FIX: Ensure consistent device handling
+        self.device = self.model.device
+
+        # Normalize device to consistent format
+        if isinstance(self.device, torch.device):
+            if self.device.type == 'cuda' and self.device.index is None:
+                # Convert 'cuda' to 'cuda:0' for consistency
+                self.device = torch.device(f'cuda:{torch.cuda.current_device()}')
+                self.model = self.model.to(self.device)
+
+        logger.info(f"Trainer using device: {self.device}")
+
     def evaluate_on_dev_set(self, val_dataset: Dataset, epoch: int) -> Tuple[float, Dict[str, List[Tuple[str, float]]]]:
         """
         Evaluate model on dev set and create run file.
@@ -222,6 +234,8 @@ class EvaluationAwareTrainer:
                           features: Dict[str, Dict],
                           first_stage_runs: Dict[str, List[Tuple[str, float]]]) -> Dict[str, List[Tuple[str, float]]]:
         """Rerank documents using the neural model."""
+        # FIX: Synchronize devices before reranking
+        self._synchronize_model_devices()
         self.model.eval()
         reranked_results = {}
 
@@ -309,6 +323,8 @@ class EvaluationAwareTrainer:
 
     def train_epoch_pointwise(self, dataset, epoch: int) -> float:
         """Train epoch with proper batching and collate function."""
+        # FIX: Synchronize devices before training
+        self._synchronize_model_devices()
         self.model.train()
 
         # Import collate function
@@ -398,9 +414,48 @@ class EvaluationAwareTrainer:
 
         return total_loss / num_batches if num_batches > 0 else 0.0
 
+        # FIX: Add method to synchronize all devices
+    def _synchronize_model_devices(self):
+        """Ensure all model components are on the same device."""
+        if not hasattr(self.model, 'alpha') or not hasattr(self.model, 'beta'):
+            return
+
+        # Get the device from model parameters (most reliable)
+        param_device = self.model.alpha.device
+
+        # Update model's device attribute
+        self.model.device = param_device
+
+        # Move encoder if needed
+        if hasattr(self.model, 'encoder') and hasattr(self.model.encoder, 'device'):
+            if str(self.model.encoder.device) != str(param_device):
+                logger.info(f"Moving encoder from {self.model.encoder.device} to {param_device}")
+                self.model.encoder.device = param_device
+
+                # Move encoder's model components
+                if hasattr(self.model.encoder, 'model'):
+                    if self.model.encoder.model_type == "sentence_transformer":
+                        self.model.encoder.model = self.model.encoder.model.to(param_device)
+                    else:  # huggingface
+                        self.model.encoder.model = self.model.encoder.model.to(param_device)
+
+        logger.info(f"All model components synchronized to device: {param_device}")
+
     def safe_forward_pass(self, query: str, expansion_features: Dict, document: str):
         """Safe forward pass with tensor shape validation."""
         try:
+
+            # FIX: Temporarily move model to consistent device before forward pass
+            original_device = self.model.device
+
+            # Ensure model is on the same device format as its parameters
+            if hasattr(self.model, 'alpha') and hasattr(self.model, 'beta'):
+                param_device = self.model.alpha.device
+                if str(original_device) != str(param_device):
+                    logger.debug(f"Device mismatch detected: model={original_device}, params={param_device}")
+                    # Use the parameter device as the canonical device
+                    self.model.device = param_device
+
             predicted_score = self.model.forward(
                 query=query,
                 expansion_features=expansion_features,
@@ -422,27 +477,38 @@ class EvaluationAwareTrainer:
 
         except Exception as e:
             logger.error(f"Error in safe_forward_pass: {e}")
+            # Log detailed device information for debugging
+            logger.error(f"Model device attribute: {getattr(self.model, 'device', 'None')}")
+            if hasattr(self.model, 'alpha'):
+                logger.error(f"Model alpha device: {self.model.alpha.device}")
+            if hasattr(self.model, 'beta'):
+                logger.error(f"Model beta device: {self.model.beta.device}")
+            if hasattr(self.model, 'encoder'):
+                logger.error(f"Encoder device: {getattr(self.model.encoder, 'device', 'None')}")
             raise
 
     def safe_target_creation(self, relevance_value, loss_type: str):
         """Create target tensor with proper shape for loss computation."""
         try:
+            # FIX: Use the actual parameter device instead of model.device
+            target_device = self.model.alpha.device if hasattr(self.model, 'alpha') else self.device
+
             if loss_type == "mse":
                 target_score = torch.tensor(
                     float(relevance_value),
-                    device=self.model.device,
+                    device=target_device,  # Use parameter device
                     dtype=torch.float32
                 )
             elif loss_type == "bce":
                 target_score = torch.tensor(
                     1.0 if float(relevance_value) > 0 else 0.0,
-                    device=self.model.device,
+                    device=target_device,  # Use parameter device
                     dtype=torch.float32
                 )
             else:
                 target_score = torch.tensor(
                     float(relevance_value),
-                    device=self.model.device,
+                    device=target_device,  # Use parameter device
                     dtype=torch.float32
                 )
 
@@ -560,6 +626,8 @@ class EvaluationAwareTrainer:
 
     def evaluate_training_loss(self, dataset: Dataset) -> float:
         """Evaluate training loss on validation set with proper collate function."""
+        # FIX: Synchronize devices before evaluation
+        self._synchronize_model_devices()
         self.model.eval()
         total_loss = 0.0
         num_examples = 0

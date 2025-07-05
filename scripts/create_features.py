@@ -62,6 +62,9 @@ def main():
     # Feature extraction arguments
     parser.add_argument('--semantic-model', type=str, default='all-MiniLM-L6-v2',
                         help='Sentence transformer model for semantic similarity')
+    # Add this with the other feature extraction arguments:
+    parser.add_argument('--force-hf', action='store_true',
+                        help='Force using HuggingFace transformers instead of SentenceTransformers')
     parser.add_argument('--max-expansion-terms', type=int, default=15,
                         help='Maximum expansion terms per query')
     parser.add_argument('--top-k-pseudo-docs', type=int, default=10,
@@ -92,7 +95,8 @@ def main():
                 'embedding_model': args.semantic_model,
                 'max_expansion_terms': args.max_expansion_terms,
                 'top_k_pseudo_docs': args.top_k_pseudo_docs,
-                'rm_alpha': args.rm_alpha
+                'rm_alpha': args.rm_alpha,
+                'force_hf': args.force_hf  # Add this line
             }
             feature_extractor = ExpansionFeatureExtractor(config)
             logger.info("All components initialized successfully")

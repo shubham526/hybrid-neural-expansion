@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import Dict, List, Tuple, Optional
-from sentence_transformers import SentenceTransformer
+from src.core.semantic_similarity import SemanticSimilarity
 
 logger = logging.getLogger(__name__)
 
@@ -28,18 +28,45 @@ class ConfigurableNeuralReranker(nn.Module):
                  hidden_dim: int = 128,
                  dropout: float = 0.1,
                  scoring_method: str = "neural",  # "neural", "cosine", or "bilinear"
-                 device: str = None):
+                 device: str = None,
+                 force_hf: bool = False,  # NEW parameter
+                 pooling_strategy: str = 'cls'
+    ):
         super().__init__()
 
         self.model_name = model_name
         self.max_expansion_terms = max_expansion_terms
         self.hidden_dim = hidden_dim
         self.scoring_method = scoring_method  # NEW
+        self.force_hf = force_hf  # NEW
+        self.pooling_strategy = pooling_strategy  # NEW
 
-        # Load sentence transformer
-        self.encoder = SentenceTransformer(model_name, device=device)
-        self.embedding_dim = self.encoder.get_sentence_embedding_dimension()
-        self.device = self.encoder.device
+        # Determine device FIRST
+        if device is None:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = torch.device(device)
+
+        # Load sentence transformer with explicit device
+        self.encoder = SemanticSimilarity(
+            model_name=model_name,
+            device=str(self.device),  # Pass device as string
+            force_hf=force_hf,
+            pooling_strategy=pooling_strategy
+        )
+
+        # Get embedding dimension after encoder is initialized
+        if self.encoder.model_type == "sentence_transformer":
+            self.embedding_dim = self.encoder.model.get_sentence_embedding_dimension()
+            # Ensure encoder model is on correct device
+            self.encoder.model = self.encoder.model.to(self.device)
+        else:  # huggingface
+            self.embedding_dim = self.encoder.embedding_dim
+            # Ensure encoder model is on correct device
+            self.encoder.model = self.encoder.model.to(self.device)
+
+        # Update encoder's device reference
+        self.encoder.device = self.device
 
         logger.info(f"Model device: {self.device}")
         logger.info(f"Embedding dimension: {self.embedding_dim}")
@@ -117,9 +144,12 @@ class ConfigurableNeuralReranker(nn.Module):
 
     def encode_text(self, text: str) -> torch.Tensor:
         """Encode text ensuring output is on correct device."""
-        with torch.no_grad():
-            # Disable progress bar for cleaner output
-            embedding = self.encoder.encode([text], convert_to_tensor=True, show_progress_bar=False)[0]
+        # Use the enhanced SemanticSimilarity encode method
+        embedding = self.encoder.encode(text)
+
+        # Convert numpy to torch tensor if needed
+        if isinstance(embedding, np.ndarray):
+            embedding = torch.from_numpy(embedding)
 
         embedding = embedding.to(self.device, dtype=torch.float32)
         return embedding
@@ -129,9 +159,14 @@ class ConfigurableNeuralReranker(nn.Module):
         if not terms:
             return torch.zeros(1, self.embedding_dim, device=self.device, dtype=torch.float32)
 
-        with torch.no_grad():
-            # Disable progress bar for cleaner output
-            embeddings = self.encoder.encode(terms, convert_to_tensor=True, show_progress_bar=False)
+        # Use the enhanced SemanticSimilarity encode method
+        embeddings = self.encoder.encode(terms)
+
+        # Convert numpy to torch tensor if needed
+        if isinstance(embeddings, np.ndarray):
+            embeddings = torch.from_numpy(embeddings)
+        elif isinstance(embeddings, list):
+            embeddings = torch.from_numpy(np.array(embeddings))
 
         embeddings = embeddings.to(self.device, dtype=torch.float32)
         return embeddings
@@ -342,10 +377,29 @@ class ConfigurableNeuralReranker(nn.Module):
         logger.info(f"Switched scoring method from {old_method} to {new_method}")
 
     def to(self, device):
-        """Override to method to ensure sentence transformer is also moved."""
+        """Override to method to ensure all components are moved to device."""
+        # Convert device to torch.device if it's a string
+        if isinstance(device, str):
+            device = torch.device(device)
+
+        # Move the main module
         super().to(device)
-        self.encoder = self.encoder.to(device)
+
+        # Update device reference
         self.device = device
+
+        # Move encoder components
+        if hasattr(self.encoder, 'model'):
+            if self.encoder.model_type == "sentence_transformer":
+                self.encoder.model = self.encoder.model.to(device)
+            else:  # huggingface
+                self.encoder.model = self.encoder.model.to(device)
+            self.encoder.device = device
+
+        # Ensure parameters are on correct device
+        self.alpha = self.alpha.to(device)
+        self.beta = self.beta.to(device)
+
         logger.info(f"Model moved to device: {device}")
         return self
 
@@ -397,20 +451,30 @@ class ConfigurableNeuralReranker(nn.Module):
 
 # Factory function with scoring method option
 def create_neural_reranker(model_name: str = 'all-MiniLM-L6-v2',
-                           scoring_method: str = "neural",  # NEW parameter
+                           scoring_method: str = "neural",
+                           force_hf: bool = False,  # NEW parameter
+                           pooling_strategy: str = 'cls',  # NEW parameter
                            **kwargs) -> ConfigurableNeuralReranker:
     """
     Factory function to create neural reranker with configurable scoring.
 
     Args:
-        model_name: Sentence transformer model name
-        scoring_method: "neural" (default) or "cosine"
+        model_name: Model name (SentenceTransformer or HuggingFace)
+        scoring_method: "neural", "bilinear", or "cosine"
+        force_hf: Force using HuggingFace transformers
+        pooling_strategy: Pooling strategy for HF models
         **kwargs: Other model parameters
 
     Returns:
         Configured neural reranker
     """
-    return ConfigurableNeuralReranker(model_name=model_name, scoring_method=scoring_method, **kwargs)
+    return ConfigurableNeuralReranker(
+        model_name=model_name,
+        scoring_method=scoring_method,
+        force_hf=force_hf,
+        pooling_strategy=pooling_strategy,
+        **kwargs
+    )
 
 
 # Example usage and comparison
