@@ -6,7 +6,8 @@ Enhanced version that supports:
 1. Fold-based cross-validation (original functionality)
 2. Single train/test splits (e.g., DL19 train, DL20 test)
 3. Proper DL experimental setup (MS MARCO train + DL val/test)
-4. Simple document loading with generator
+4. Training subset support for sampled queries
+5. Simple document loading with generator
 """
 
 import argparse
@@ -14,8 +15,9 @@ import json
 import logging
 import sys
 import random
+import pandas as pd
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Set
 from collections import defaultdict
 
 # Add project root to path
@@ -29,6 +31,59 @@ from cross_encoder.src.utils.file_utils import load_json, save_json, load_trec_r
 from cross_encoder.src.utils.logging_utils import setup_experiment_logging, log_experiment_info, TimedOperation
 
 logger = logging.getLogger(__name__)
+
+
+def load_train_subset_queries(subset_file: str) -> Set[str]:
+    """
+    Load training subset query IDs from TSV file.
+
+    Args:
+        subset_file: Path to TSV file with query_id and query_text columns
+
+    Returns:
+        Set of query IDs to use for training
+    """
+    logger.info(f"Loading training subset from: {subset_file}")
+
+    try:
+        # Try pandas first (handles various formats well)
+        df = pd.read_csv(subset_file, sep='\t', dtype=str)
+
+        # Check for expected columns
+        if 'query_id' not in df.columns:
+            raise ValueError("TSV file must have 'query_id' column")
+
+        query_ids = set(df['query_id'].astype(str).tolist())
+        logger.info(f"Loaded {len(query_ids)} query IDs from subset file")
+
+        # Log a few examples
+        sample_ids = list(query_ids)[:5]
+        logger.info(f"Sample query IDs: {sample_ids}")
+
+        return query_ids
+
+    except Exception as e:
+        # Fallback to manual parsing
+        logger.warning(f"Pandas loading failed ({e}), trying manual parsing...")
+
+        query_ids = set()
+        with open(subset_file, 'r', encoding='utf-8') as f:
+            header = f.readline().strip().split('\t')
+
+            if 'query_id' not in header:
+                raise ValueError("TSV file must have 'query_id' column in header")
+
+            qid_idx = header.index('query_id')
+
+            for line_num, line in enumerate(f, 2):  # Start from line 2 (after header)
+                fields = line.strip().split('\t')
+                if len(fields) > qid_idx:
+                    query_ids.add(fields[qid_idx])
+                else:
+                    logger.warning(f"Line {line_num}: Not enough fields, skipping")
+
+        logger.info(f"Manually parsed {len(query_ids)} query IDs from subset file")
+        return query_ids
 
 
 def get_query_text(query_obj):
@@ -165,6 +220,7 @@ class DocumentLoader:
                 for doc_id in doc_ids
                 if doc_id in self.documents}
 
+
 class TrainTestDataCreator:
     """Enhanced data creator supporting both fold-based and single splits with document loading."""
 
@@ -179,21 +235,43 @@ class TrainTestDataCreator:
         logger.info(f"  Max candidates per query: {max_candidates_per_query}")
         logger.info(f"  Ensure positive examples: {ensure_positive_examples}")
 
-    def load_dataset_components(self, dataset_name: str, run_file_path: str = None) -> Dict[str, Any]:
-        """Load all components from ir_datasets with simple document loading."""
+    def load_dataset_components(self, dataset_name: str, run_file_path: str = None,
+                                query_subset: Set[str] = None, shared_documents: Dict[str, str] = None) -> Dict[
+        str, Any]:
+        """
+        Load all components from ir_datasets with simple document loading.
+
+        Args:
+            dataset_name: Name of the dataset
+            run_file_path: Optional path to run file
+            query_subset: Optional set of query IDs to filter to
+            shared_documents: Pre-loaded documents to avoid reloading
+        """
         logger.info(f"Loading dataset components: {dataset_name}")
+        if query_subset:
+            logger.info(f"Will filter to {len(query_subset)} queries from subset")
 
         dataset = ir_datasets.load(dataset_name)
 
         # Load queries
         queries = {}
         for query in dataset.queries_iter():
+            # Filter to subset if specified
+            if query_subset and query.query_id not in query_subset:
+                continue
             queries[query.query_id] = get_query_text(query)
-        logger.info(f"Loaded {len(queries)} queries")
+
+        if query_subset:
+            logger.info(f"Loaded {len(queries)} queries (filtered from subset)")
+        else:
+            logger.info(f"Loaded {len(queries)} queries")
 
         # Load qrels
         qrels = defaultdict(dict)
         for qrel in dataset.qrels_iter():
+            # Filter to subset if specified
+            if query_subset and qrel.query_id not in query_subset:
+                continue
             qrels[qrel.query_id][qrel.doc_id] = qrel.relevance
         logger.info(f"Loaded qrels for {len(qrels)} queries")
 
@@ -203,6 +281,9 @@ class TrainTestDataCreator:
         if dataset.has_scoreddocs():
             logger.info("Using dataset scoreddocs for first-stage runs")
             for sdoc in dataset.scoreddocs_iter():
+                # Filter to subset if specified
+                if query_subset and sdoc.query_id not in query_subset:
+                    continue
                 first_stage_runs[sdoc.query_id].append((sdoc.doc_id, sdoc.score))
 
             # Sort by score (descending)
@@ -212,6 +293,12 @@ class TrainTestDataCreator:
         elif run_file_path:
             logger.info(f"Loading first-stage runs from: {run_file_path}")
             run_data = load_trec_run(run_file_path)
+
+            # Filter to subset if specified
+            if query_subset:
+                run_data = {qid: docs for qid, docs in run_data.items()
+                            if qid in query_subset}
+
             first_stage_runs.update(run_data)
 
         else:
@@ -219,19 +306,24 @@ class TrainTestDataCreator:
 
         logger.info(f"Loaded first-stage runs for {len(first_stage_runs)} queries")
 
-        # Create simple document loader
-        logger.info("Setting up simple document loader...")
-        document_loader = DocumentLoader(dataset)
+        # Use shared documents or create document loader
+        if shared_documents is not None:
+            logger.info(f"Using shared document collection ({len(shared_documents)} documents)")
+            documents = shared_documents
+        else:
+            logger.info("Setting up document loader...")
+            document_loader = DocumentLoader(dataset)
+            documents = document_loader.documents
 
         return {
             'queries': dict(queries),
             'qrels': dict(qrels),
             'first_stage_runs': dict(first_stage_runs),
-            'documents': document_loader.documents,  # Use the documents dict directly
+            'documents': documents,
             'dataset': dataset
         }
 
-    def load_ms_marco_validation_data(self) -> Dict[str, Any]:
+    def load_ms_marco_validation_data(self, shared_documents: Dict[str, str] = None) -> Dict[str, Any]:
         """Load full MS MARCO dev/small set for validation."""
         logger.info("Loading MS MARCO dev/small set for validation")
 
@@ -256,12 +348,22 @@ class TrainTestDataCreator:
                 for sdoc in ms_marco_dev_small.scoreddocs_iter():
                     val_runs[sdoc.query_id].append((sdoc.doc_id, sdoc.score))
 
+            # Use shared documents if available, otherwise load them
+            if shared_documents is not None:
+                logger.info(f"Using shared document collection for MS MARCO validation")
+                documents = shared_documents
+            else:
+                logger.info("Loading documents for MS MARCO validation")
+                document_loader = DocumentLoader(ms_marco_dev_small)
+                documents = document_loader.documents
+
             logger.info(f"Loaded MS MARCO dev/small: {len(val_queries)} queries, {len(val_qrels)} qrels")
 
             return {
                 'queries': dict(val_queries),
                 'qrels': dict(val_qrels),
-                'first_stage_runs': dict(val_runs)
+                'first_stage_runs': dict(val_runs),
+                'documents': documents
             }
 
         except Exception as e:
@@ -325,7 +427,8 @@ class TrainTestDataCreator:
                                          features_test: Dict[str, Any],
                                          run_file_path_train: str = None,
                                          run_file_path_val: str = None,
-                                         run_file_path_test: str = None) -> Dict[str, Any]:
+                                         run_file_path_test: str = None,
+                                         train_subset_file: str = None) -> Dict[str, Any]:
         """
         Create proper TREC DL experimental setup.
 
@@ -335,10 +438,17 @@ class TrainTestDataCreator:
             features_train: Features for MS MARCO train/judged
             features_val: Features for validation DL year
             features_test: Features for test DL year
+            train_subset_file: Optional TSV file with subset of training queries
 
         Returns:
             Dictionary with train/val/test data
         """
+
+        # Load training subset if specified
+        train_query_subset = None
+        if train_subset_file:
+            train_query_subset = load_train_subset_queries(train_subset_file)
+            logger.info(f"Will use {len(train_query_subset)} queries from training subset")
 
         # Dataset names
         train_dataset = "msmarco-passage/train/judged"
@@ -347,13 +457,28 @@ class TrainTestDataCreator:
 
         logger.info(f"Creating proper DL experiment:")
         logger.info(f"  Train: {train_dataset}")
+        if train_subset_file:
+            logger.info(f"    Using subset from: {train_subset_file}")
         logger.info(f"  Validation: {val_dataset}")
         logger.info(f"  Test: {test_dataset}")
 
         # Load all dataset components
-        train_components = self.load_dataset_components(train_dataset, run_file_path_train)
-        val_components = self.load_dataset_components(val_dataset, run_file_path_val)
-        test_components = self.load_dataset_components(test_dataset, run_file_path_test)
+        train_components = self.load_dataset_components(train_dataset, run_file_path_train,
+                                                        query_subset=train_query_subset)
+
+        # For proper_dl mode, check if we can share documents between val/test datasets
+        shared_documents = None
+        if self._datasets_share_documents(val_dataset, test_dataset):
+            logger.info("Validation and test datasets share the same document collection")
+            # Load documents once for both val and test
+            temp_dataset = ir_datasets.load(val_dataset)
+            document_loader = DocumentLoader(temp_dataset)
+            shared_documents = document_loader.documents
+
+        val_components = self.load_dataset_components(val_dataset, run_file_path_val,
+                                                      shared_documents=shared_documents)
+        test_components = self.load_dataset_components(test_dataset, run_file_path_test,
+                                                       shared_documents=shared_documents)
 
         # Log dataset sizes
         logger.info(f"Train queries: {len(train_components['queries'])}")
@@ -445,7 +570,8 @@ class TrainTestDataCreator:
                                  features_test: Dict[str, Any],
                                  val_strategy: str = "random_split",
                                  run_file_path_train: str = None,
-                                 run_file_path_test: str = None) -> Dict[str, Any]:
+                                 run_file_path_test: str = None,
+                                 features_val: Dict[str, Any] = None) -> Dict[str, Any]:
         """
         Create single train/val/test split (e.g., DL19 train, DL20 test).
 
@@ -463,20 +589,32 @@ class TrainTestDataCreator:
         """
         logger.info(f"Creating single split: {train_dataset_name} → {test_dataset_name}")
 
-        # Load training dataset
-        train_components = self.load_dataset_components(train_dataset_name, run_file_path_train)
+        # Check if both datasets use the same document collection
+        shared_documents = None
+        if self._datasets_share_documents(train_dataset_name, test_dataset_name):
+            logger.info("Datasets share the same document collection - loading documents once")
+            # Load documents from the first dataset
+            temp_dataset = ir_datasets.load(train_dataset_name)
+            document_loader = DocumentLoader(temp_dataset)
+            shared_documents = document_loader.documents
 
-        # Load test dataset
-        test_components = self.load_dataset_components(test_dataset_name, run_file_path_test)
+        # Load training dataset
+        train_components = self.load_dataset_components(train_dataset_name, run_file_path_train,
+                                                        shared_documents=shared_documents)
+
+        # Load test dataset (reuse documents if available)
+        test_components = self.load_dataset_components(test_dataset_name, run_file_path_test,
+                                                       shared_documents=shared_documents)
 
         # Create validation split from training data
         if val_strategy == "ms_marco":
             # Use MS MARCO dev set for validation
-            val_components = self.load_ms_marco_validation_data()
+            val_components = self.load_ms_marco_validation_data(shared_documents=shared_documents)
             if val_components is None:
                 # Fallback to random split
                 logger.warning("MS MARCO validation failed, using random split")
                 val_strategy = "random_split"
+                features_val = features_train  # Use train features for fallback
 
         if val_strategy != "ms_marco" or val_components is None:
             # Create validation from training data
@@ -496,13 +634,15 @@ class TrainTestDataCreator:
                 'first_stage_runs': val_data[2],
                 'documents': train_components['documents']
             }
+            # Use train features when splitting from training data
+            features_val = features_train
 
         # Create examples for each split
         splits = {}
 
         for split_name, (components, features) in [
             ('train', (train_components, features_train)),
-            ('val', (val_components, features_train)),  # Use train features for val
+            ('val', (val_components, features_val)),  # Use appropriate val features
             ('test', (test_components, features_test))
         ]:
             if not components['queries']:
@@ -547,6 +687,27 @@ class TrainTestDataCreator:
             logger.info(f"Created {len(split_data)} {split_name} examples")
 
         return splits
+
+    def _datasets_share_documents(self, dataset1: str, dataset2: str) -> bool:
+        """Check if two datasets share the same document collection."""
+        # MS MARCO passage datasets share the same collection
+        msmarco_passage_datasets = [
+            'msmarco-passage/train',
+            'msmarco-passage/train/judged',
+            'msmarco-passage/dev',
+            'msmarco-passage/dev/small',
+            'msmarco-passage/trec-dl-2019',
+            'msmarco-passage/trec-dl-2020',
+            'msmarco-passage/trec-dl-2019/judged',
+            'msmarco-passage/trec-dl-2020/judged'
+        ]
+
+        # Check if both datasets are MS MARCO passage datasets
+        dataset1_base = dataset1.split('/')[0] + '/' + dataset1.split('/')[1] if '/' in dataset1 else dataset1
+        dataset2_base = dataset2.split('/')[0] + '/' + dataset2.split('/')[1] if '/' in dataset2 else dataset2
+
+        return (any(dataset1.startswith(d.split('/')[0] + '/' + d.split('/')[1]) for d in msmarco_passage_datasets) and
+                any(dataset2.startswith(d.split('/')[0] + '/' + d.split('/')[1]) for d in msmarco_passage_datasets))
 
     def create_fold_data(self, fold_info: Dict[str, List[str]],
                          features: Dict[str, Any],
@@ -700,6 +861,8 @@ def main():
                         help='Path to training features file (for single mode)')
     parser.add_argument('--test-features-file', type=str,
                         help='Path to test features file (for single mode)')
+    parser.add_argument('--val-features-file', type=str,
+                        help='Path to validation features file (for single mode with ms_marco strategy)')
     parser.add_argument('--val-strategy', type=str, default='random_split',
                         choices=['random_split', 'first_n', 'ms_marco', 'no_val'],
                         help='Validation set creation strategy')
@@ -715,6 +878,8 @@ def main():
                         help='DL year for testing (proper_dl mode)')
     parser.add_argument('--val-features-file', type=str,
                         help='Path to validation DL features (proper_dl mode)')
+    parser.add_argument('--train-subset-file', type=str,
+                        help='Path to TSV file with subset of training queries (proper_dl mode)')
 
     # Other arguments
     parser.add_argument('--save-statistics', action='store_true',
@@ -736,6 +901,10 @@ def main():
         missing = [arg for arg in required_single_args if not getattr(args, arg)]
         if missing:
             parser.error(f"Single mode requires: {', '.join(missing)}")
+
+        # Check if ms_marco validation strategy requires val features file
+        if args.val_strategy == 'ms_marco' and not args.val_features_file:
+            parser.error("ms_marco validation strategy requires --val-features-file")
 
     elif args.mode == 'proper_dl':
         required_dl_args = ['val_year', 'test_year', 'train_features_file', 'val_features_file', 'test_features_file']
@@ -858,6 +1027,12 @@ def main():
                 logger.info(f"Loaded train features for {len(features_train)} queries")
                 logger.info(f"Loaded test features for {len(features_test)} queries")
 
+                # Load validation features if specified
+                features_val = None
+                if args.val_features_file:
+                    features_val = load_features_file(args.val_features_file)
+                    logger.info(f"Loaded validation features for {len(features_val)} queries")
+
             with TimedOperation(logger, "Creating single split data"):
                 split_data = data_creator.create_single_split_data(
                     train_dataset_name=args.train_dataset,
@@ -866,7 +1041,8 @@ def main():
                     features_test=features_test,
                     val_strategy=args.val_strategy,
                     run_file_path_train=args.run_file_train,
-                    run_file_path_test=args.run_file_test
+                    run_file_path_test=args.run_file_test,
+                    features_val=features_val
                 )
 
             # Save files
@@ -913,6 +1089,8 @@ def main():
             logger.info(f"\n{'=' * 50}")
             logger.info(f"Creating Proper DL Experimental Setup")
             logger.info(f"Train: MS MARCO passage/train/judged")
+            if args.train_subset_file:
+                logger.info(f"  Using subset from: {args.train_subset_file}")
             logger.info(f"Validation: TREC DL 20{args.val_year}")
             logger.info(f"Test: TREC DL 20{args.test_year}")
             logger.info(f"{'=' * 50}")
@@ -932,7 +1110,8 @@ def main():
                     test_year=args.test_year,
                     features_train=features_train,
                     features_val=features_val,
-                    features_test=features_test
+                    features_test=features_test,
+                    train_subset_file=args.train_subset_file
                 )
 
             # Save files
@@ -954,6 +1133,7 @@ def main():
                 summary_stats = {
                     'mode': 'proper_dl',
                     'train_dataset': 'msmarco-passage/train/judged',
+                    'train_subset_file': args.train_subset_file,
                     'val_dataset': f'msmarco-passage/trec-dl-20{args.val_year}',
                     'test_dataset': f'msmarco-passage/trec-dl-20{args.test_year}',
                     'splits': all_stats,
@@ -1004,6 +1184,7 @@ def main():
             summary = {
                 'mode': 'proper_dl',
                 'train_dataset': 'msmarco-passage/train/judged',
+                'train_subset_file': args.train_subset_file,
                 'val_dataset': f'msmarco-passage/trec-dl-20{args.val_year}',
                 'test_dataset': f'msmarco-passage/trec-dl-20{args.test_year}',
                 'train_features_file': args.train_features_file,
@@ -1039,7 +1220,10 @@ def main():
             logger.info("2. Evaluate model:")
             logger.info(f"   python scripts/evaluate.py --test-file {output_dir}/test.jsonl")
         else:  # proper_dl mode
-            logger.info(f"Train: MS MARCO passage/train/judged (~532K queries)")
+            if args.train_subset_file:
+                logger.info(f"Train: MS MARCO passage/train/judged (subset from {args.train_subset_file})")
+            else:
+                logger.info(f"Train: MS MARCO passage/train/judged (~532K queries)")
             logger.info(f"Validation: TREC DL 20{args.val_year}")
             logger.info(f"Test: TREC DL 20{args.test_year}")
             logger.info("Next steps:")

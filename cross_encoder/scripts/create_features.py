@@ -62,6 +62,64 @@ def sample_queries(queries, sample_size, random_seed=42):
     return sampled_queries
 
 
+def get_domain_appropriate_model(dataset_name: str, user_specified_model: str) -> tuple[str, bool]:
+    """
+    Get domain-appropriate embedding model for dataset.
+
+    Returns:
+        tuple: (model_name, force_hf_flag)
+    """
+
+    # If user specified a non-default model, respect their choice
+    default_model = 'all-MiniLM-L6-v2'
+    if user_specified_model != default_model:
+        # Detect if user model needs force_hf
+        needs_force_hf = not user_specified_model.startswith('sentence-transformers/')
+        logger.info(f"Using user-specified model for {dataset_name}: {user_specified_model}")
+        if needs_force_hf:
+            logger.info(f"Auto-enabling --force-hf for HuggingFace model: {user_specified_model}")
+        return user_specified_model, needs_force_hf
+
+    # Domain-specific model mapping with force_hf info
+    domain_models = {
+        # Scientific domains (need force_hf)
+        'scifact': ('allenai/scibert-scivocab-uncased', True),
+        'scidocs': ('allenai/scibert-scivocab-uncased', True),
+        'nfcorpus': ('emilyalsentzer/Bio_ClinicalBERT', True),
+        'bioasq': ('dmis-lab/biobert-base-cased-v1.1', True),
+        'trec-covid': ('allenai/scibert-scivocab-uncased', True),
+
+        # Financial domain (needs force_hf)
+        'fiqa': ('ProsusAI/finbert', True),
+
+        # Better general models (SentenceTransformers - no force_hf)
+        'nq': ('sentence-transformers/all-mpnet-base-v2', False),
+        'hotpotqa': ('sentence-transformers/all-mpnet-base-v2', False),
+        'msmarco': ('sentence-transformers/all-MiniLM-L6-v2', False),
+        'robust04': ('sentence-transformers/all-mpnet-base-v2', False),
+        'fever': ('sentence-transformers/all-mpnet-base-v2', False),
+        'climate-fever': ('sentence-transformers/all-mpnet-base-v2', False),
+        'dbpedia': ('sentence-transformers/all-mpnet-base-v2', False),
+        'arguana': ('sentence-transformers/all-mpnet-base-v2', False),
+        'touche': ('sentence-transformers/all-mpnet-base-v2', False),
+        'cqadupstack': ('sentence-transformers/all-mpnet-base-v2', False),
+        'quora': ('sentence-transformers/all-mpnet-base-v2', False),
+    }
+
+    # Extract dataset name from full path (e.g., 'beir/scifact' -> 'scifact')
+    dataset_key = dataset_name.split('/')[-1].lower()
+
+    if dataset_key in domain_models:
+        selected_model, force_hf = domain_models[dataset_key]
+        logger.info(f"Auto-selected domain-specific model for {dataset_name}: {selected_model}")
+        if force_hf:
+            logger.info(f"Auto-enabling --force-hf for domain model: {selected_model}")
+        return selected_model, force_hf
+    else:
+        logger.info(f"Using default model for {dataset_name}: {default_model}")
+        return default_model, False  # Default model is SentenceTransformers
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Extract RM3 and semantic similarity features for neural reranking",
