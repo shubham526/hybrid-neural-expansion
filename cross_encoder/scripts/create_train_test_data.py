@@ -232,37 +232,31 @@ class TrainTestDataCreator:
         }
 
     def load_ms_marco_validation_data(self) -> Dict[str, Any]:
-        """Load MS MARCO dev set for validation."""
-        logger.info("Loading MS MARCO dev set for validation")
+        """Load full MS MARCO dev/small set for validation."""
+        logger.info("Loading MS MARCO dev/small set for validation")
 
         try:
-            # Load MS MARCO passage dev set
-            ms_marco_dev = ir_datasets.load("msmarco-passage/dev")
+            # Load MS MARCO dev/small set from ir_datasets
+            ms_marco_dev_small = ir_datasets.load("msmarco-passage/dev/small")
 
-            # Take a subset for validation (e.g., first 1000 queries)
             val_queries = {}
             val_qrels = defaultdict(dict)
             val_runs = defaultdict(list)
 
-            query_count = 0
-            for query in ms_marco_dev.queries_iter():
-                if query_count >= 1000:  # Limit validation set size
-                    break
+            # Load all queries
+            for query in ms_marco_dev_small.queries_iter():
                 val_queries[query.query_id] = get_query_text(query)
-                query_count += 1
 
-            # Load corresponding qrels
-            for qrel in ms_marco_dev.qrels_iter():
-                if qrel.query_id in val_queries:
-                    val_qrels[qrel.query_id][qrel.doc_id] = qrel.relevance
+            # Load all qrels
+            for qrel in ms_marco_dev_small.qrels_iter():
+                val_qrels[qrel.query_id][qrel.doc_id] = qrel.relevance
 
-            # Load scoreddocs if available
-            if ms_marco_dev.has_scoreddocs():
-                for sdoc in ms_marco_dev.scoreddocs_iter():
-                    if sdoc.query_id in val_queries:
-                        val_runs[sdoc.query_id].append((sdoc.doc_id, sdoc.score))
+            # Load all scored docs if available
+            if ms_marco_dev_small.has_scoreddocs():
+                for sdoc in ms_marco_dev_small.scoreddocs_iter():
+                    val_runs[sdoc.query_id].append((sdoc.doc_id, sdoc.score))
 
-            logger.info(f"Loaded MS MARCO validation: {len(val_queries)} queries, {len(val_qrels)} qrels")
+            logger.info(f"Loaded MS MARCO dev/small: {len(val_queries)} queries, {len(val_qrels)} qrels")
 
             return {
                 'queries': dict(val_queries),
@@ -271,7 +265,7 @@ class TrainTestDataCreator:
             }
 
         except Exception as e:
-            logger.warning(f"Could not load MS MARCO validation data: {e}")
+            logger.warning(f"Could not load MS MARCO dev/small data: {e}")
             return None
 
     def create_training_example(self,

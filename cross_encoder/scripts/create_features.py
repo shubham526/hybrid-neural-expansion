@@ -11,10 +11,12 @@ import argparse
 import logging
 import sys
 import json
+import random
 from pathlib import Path
 
 # Add project root to path
-project_root = Path(__file__).resolve().parent.parent
+# Add the project's root directory to the Python path
+project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 import ir_datasets
@@ -36,6 +38,30 @@ def get_query_text(query_obj):
     return ""
 
 
+def sample_queries(queries, sample_size, random_seed=42):
+    """
+    Sample a subset of queries from the full query set.
+
+    Args:
+        queries: Dictionary of {query_id: query_text}
+        sample_size: Number of queries to sample
+        random_seed: Random seed for reproducibility
+
+    Returns:
+        Dictionary of sampled queries
+    """
+    if len(queries) <= sample_size:
+        logger.info(f"Dataset has {len(queries)} queries, no sampling needed")
+        return queries
+
+    random.seed(random_seed)
+    sampled_qids = random.sample(list(queries.keys()), sample_size)
+    sampled_queries = {qid: queries[qid] for qid in sampled_qids}
+
+    logger.info(f"Sampled {len(sampled_queries)} queries from {len(queries)} total queries")
+    return sampled_queries
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Extract RM3 and semantic similarity features for neural reranking",
@@ -50,6 +76,12 @@ def main():
     parser.add_argument('--query-ids-file', type=str,
                         help='File with query IDs to process (optional)')
 
+    # Sampling arguments
+    parser.add_argument('--sample-size', type=int, default=None,
+                        help='Number of queries to sample (default: use all queries)')
+    parser.add_argument('--random-seed', type=int, default=42,
+                        help='Random seed for query sampling')
+
     # RM3 arguments
     parser.add_argument('--index-path', type=str, required=True,
                         help='Path to Lucene index for RM3 expansion')
@@ -61,7 +93,6 @@ def main():
     # Feature extraction arguments
     parser.add_argument('--semantic-model', type=str, default='all-MiniLM-L6-v2',
                         help='Sentence transformer model for semantic similarity')
-    # Add this with the other feature extraction arguments:
     parser.add_argument('--force-hf', action='store_true',
                         help='Force using HuggingFace transformers instead of SentenceTransformers')
     parser.add_argument('--max-expansion-terms', type=int, default=15,
@@ -95,7 +126,7 @@ def main():
                 'max_expansion_terms': args.max_expansion_terms,
                 'top_k_pseudo_docs': args.top_k_pseudo_docs,
                 'rm_alpha': args.rm_alpha,
-                'force_hf': args.force_hf  # Add this line
+                'force_hf': args.force_hf
             }
             feature_extractor = ExpansionFeatureExtractor(config)
             logger.info("All components initialized successfully")
@@ -112,10 +143,32 @@ def main():
                     subset_qids = {line.strip() for line in f if line.strip()}
                 queries = {qid: text for qid, text in queries.items() if qid in subset_qids}
 
-            logger.info(f"Loaded {len(queries)} queries to be processed.")
+            logger.info(f"Loaded {len(queries)} queries from dataset")
+
+            # Sample queries if requested
+            if args.sample_size is not None:
+                queries = sample_queries(queries, args.sample_size, args.random_seed)
+
+            logger.info(f"Processing {len(queries)} queries for feature extraction")
+
+        # Save sampled queries to TSV file if sampling was used
+        if args.sample_size is not None:
+            queries_tsv_path = output_dir / f"{args.dataset.replace('/', '_')}_sampled_queries_{args.sample_size}.tsv"
+            with TimedOperation(logger, f"Saving sampled queries to {queries_tsv_path}"):
+                with open(queries_tsv_path, 'w', encoding='utf-8') as f_tsv:
+                    f_tsv.write("query_id\tquery_text\n")  # Header
+                    for query_id, query_text in queries.items():
+                        # Escape tabs and newlines in query text
+                        escaped_text = query_text.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
+                        f_tsv.write(f"{query_id}\t{escaped_text}\n")
+                logger.info(f"Saved {len(queries)} sampled queries to TSV file")
 
         # Extract features and write them to a JSONL file line by line
-        output_path = output_dir / f"{args.dataset.replace('/', '_')}_features.jsonl"
+        output_filename = f"{args.dataset.replace('/', '_')}_features"
+        if args.sample_size is not None:
+            output_filename += f"_sample_{args.sample_size}"
+        output_path = output_dir / f"{output_filename}.jsonl"
+
         with TimedOperation(logger, f"Extracting and writing features to {output_path}"):
             with open(output_path, 'w') as f_out:
                 for query_id, query_text in tqdm(queries.items(), desc="Extracting features"):
@@ -129,6 +182,9 @@ def main():
         logger.info("=" * 60)
         logger.info("FEATURE EXTRACTION COMPLETED SUCCESSFULLY!")
         logger.info(f"Features saved to: {output_path}")
+        if args.sample_size is not None:
+            logger.info(f"Used sampling: {args.sample_size} queries from original dataset")
+            logger.info(f"Sampled queries saved to: {queries_tsv_path}")
         logger.info("=" * 60)
 
     except Exception as e:
