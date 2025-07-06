@@ -21,7 +21,7 @@ from typing import Dict, List, Any, Optional, Tuple, Set
 from collections import defaultdict
 
 # Add project root to path
-project_root = Path(__file__).resolve().parent.parent
+project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 import ir_datasets
@@ -876,8 +876,6 @@ def main():
                         help='DL year for validation (proper_dl mode)')
     parser.add_argument('--test-year', type=str, choices=['19', '20'],
                         help='DL year for testing (proper_dl mode)')
-    parser.add_argument('--val-features-file', type=str,
-                        help='Path to validation DL features (proper_dl mode)')
     parser.add_argument('--train-subset-file', type=str,
                         help='Path to TSV file with subset of training queries (proper_dl mode)')
 

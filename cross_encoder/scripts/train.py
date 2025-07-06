@@ -133,26 +133,73 @@ def load_qrels_file(qrels_file: Path) -> Dict[str, Dict[str, int]]:
     return dict(qrels)
 
 
-def load_evaluation_data_from_jsonl(val_file: Path, dev_qrels_file: Path = None, dataset_name: str = None):
+def load_qrels_smart(qrels_source: str, queries: Dict[str, str] = None) -> Dict[str, Dict[str, int]]:
     """
-    Load evaluation data from validation JSONL file.
+    Load qrels from either ir_datasets or TREC format file.
 
     Args:
-        val_file: Path to validation JSONL file
-        dataset_name: Dataset name for loading documents via ir_datasets
+        qrels_source: Either an ir_datasets dataset name or path to TREC qrels file
+        queries: Optional queries dict to filter qrels
 
     Returns:
-        Tuple of (queries, qrels, document_loader)
+        Dictionary {query_id: {doc_id: relevance}}
     """
+    logger.info(f"Loading qrels from: {qrels_source}")
+
+    # Try to load as ir_datasets first
+    try:
+        import ir_datasets
+        dataset = ir_datasets.load(qrels_source)
+
+        # Check if dataset has qrels
+        if not hasattr(dataset, 'qrels_iter'):
+            raise ValueError(f"Dataset {qrels_source} does not have qrels")
+
+        logger.info(f"Loading qrels from ir_datasets: {qrels_source}")
+        qrels = defaultdict(dict)
+
+        for qrel in dataset.qrels_iter():
+            # Filter to specific queries if provided
+            if queries is None or qrel.query_id in queries:
+                qrels[qrel.query_id][qrel.doc_id] = qrel.relevance
+
+        logger.info(f"Loaded qrels for {len(qrels)} queries from ir_datasets")
+        return dict(qrels)
+
+    except Exception as e:
+        logger.info(f"Could not load as ir_datasets ({e}), trying as TREC file...")
+
+        # Try to load as TREC format file
+        try:
+            qrels_path = Path(qrels_source)
+            if not qrels_path.exists():
+                raise FileNotFoundError(f"Qrels file not found: {qrels_path}")
+
+            all_qrels = load_qrels_file(qrels_path)
+
+            # Filter to specific queries if provided
+            if queries is not None:
+                qrels = {qid: qrel_dict for qid, qrel_dict in all_qrels.items() if qid in queries}
+            else:
+                qrels = all_qrels
+
+            logger.info(f"Loaded qrels for {len(qrels)} queries from TREC file")
+            return qrels
+
+        except Exception as file_error:
+            logger.error(f"Failed to load qrels as both ir_datasets and TREC file:")
+            logger.error(f"  ir_datasets error: {e}")
+            logger.error(f"  TREC file error: {file_error}")
+            raise ValueError(f"Could not load qrels from {qrels_source}")
 
 
-def load_evaluation_data_from_jsonl(val_file: Path, dev_qrels_file: Path = None, dataset_name: str = None):
+def load_evaluation_data_from_jsonl(val_file: Path, dev_qrels_file: str = None, dataset_name: str = None):
     """
     Load evaluation data from validation JSONL file and optional qrels file.
 
     Args:
         val_file: Path to validation JSONL file
-        dev_qrels_file: Path to dev qrels file (TREC format)
+        dev_qrels_file: Dev qrels source (ir_datasets name or TREC file path)
         dataset_name: Dataset name for loading documents via ir_datasets
 
     Returns:
@@ -177,16 +224,14 @@ def load_evaluation_data_from_jsonl(val_file: Path, dev_qrels_file: Path = None,
 
     logger.info(f"Extracted {len(queries)} queries from JSONL")
 
-    # Load qrels from external file if provided
+    # Load qrels from external source if provided
     qrels = {}
-    if dev_qrels_file and dev_qrels_file.exists():
-        all_qrels = load_qrels_file(dev_qrels_file)
-        # Filter to only queries present in validation data
-        qrels = {qid: qrel_dict for qid, qrel_dict in all_qrels.items() if qid in queries}
-        logger.info(f"Loaded qrels for {len(qrels)} validation queries from external file")
+    if dev_qrels_file:
+        # Use the smart loader that handles both ir_datasets and TREC files
+        qrels = load_qrels_smart(dev_qrels_file, queries)
     else:
         # Fallback: extract qrels from JSONL file
-        logger.info("No external qrels file provided, extracting from JSONL...")
+        logger.info("No external qrels source provided, extracting from JSONL...")
         qrels_from_jsonl = defaultdict(dict)
 
         for example in val_data:
@@ -224,86 +269,57 @@ def load_evaluation_data_from_jsonl(val_file: Path, dev_qrels_file: Path = None,
     return dict(queries), qrels, document_loader
 
 
-def load_evaluation_data_from_dataset(dataset_name: str, val_file: Path = None, dev_qrels_file: Path = None):
-    def load_evaluation_data_from_dataset(dataset_name: str, val_file: Path = None, dev_qrels_file: Path = None):
-        """
-        Load evaluation data from ir_datasets with optional external qrels.
+def load_evaluation_data_from_dataset(dataset_name: str, val_file: Path = None, dev_qrels_file: str = None):
+    """
+    Load evaluation data from ir_datasets with optional external qrels.
 
-        Args:
-            dataset_name: ir_datasets dataset name
-            val_file: Optional validation file to filter queries
-            dev_qrels_file: Path to external dev qrels file (TREC format)
+    Args:
+        dataset_name: ir_datasets dataset name
+        val_file: Optional validation file to filter queries
+        dev_qrels_file: External qrels source (ir_datasets name or TREC file path)
 
-        Returns:
-            Tuple of (queries, qrels, document_loader)
-        """
-        logger.info(f"Loading evaluation data from dataset: {dataset_name}")
+    Returns:
+        Tuple of (queries, qrels, document_loader)
+    """
+    logger.info(f"Loading evaluation data from dataset: {dataset_name}")
 
-        dataset = ir_datasets.load(dataset_name)
+    dataset = ir_datasets.load(dataset_name)
 
-        # Load all queries
-        all_queries = {q.query_id: get_query_text(q) for q in dataset.queries_iter()}
+    # Load all queries
+    all_queries = {q.query_id: get_query_text(q) for q in dataset.queries_iter()}
 
-        # Filter to validation queries if file provided
-        if val_file and val_file.exists():
-            val_data = load_jsonl(val_file)
-            val_query_ids = {example['query_id'] for example in val_data}
-            queries = {qid: text for qid, text in all_queries.items() if qid in val_query_ids}
-            logger.info(f"Filtered to {len(queries)} validation queries")
-        else:
-            queries = all_queries
-            logger.info(f"Using all {len(queries)} queries for evaluation")
+    # Filter to validation queries if file provided
+    if val_file and val_file.exists():
+        val_data = load_jsonl(val_file)
+        val_query_ids = {example['query_id'] for example in val_data}
+        queries = {qid: text for qid, text in all_queries.items() if qid in val_query_ids}
+        logger.info(f"Filtered to {len(queries)} validation queries")
+    else:
+        queries = all_queries
+        logger.info(f"Using all {len(queries)} queries for evaluation")
 
-        # Load qrels - prioritize external file over dataset qrels
-        qrels = {}
-        if dev_qrels_file and dev_qrels_file.exists():
-            all_qrels = load_qrels_file(dev_qrels_file)
-            # Filter to only queries present in our query set
-            qrels = {qid: qrel_dict for qid, qrel_dict in all_qrels.items() if qid in queries}
-            logger.info(f"Loaded qrels for {len(qrels)} queries from external file")
-        else:
-            # Fallback to dataset qrels
-            logger.info("No external qrels file provided, using dataset qrels...")
-            qrels_from_dataset = defaultdict(dict)
-            for qrel in dataset.qrels_iter():
-                if qrel.query_id in queries:
-                    qrels_from_dataset[qrel.query_id][qrel.doc_id] = qrel.relevance
-            qrels = dict(qrels_from_dataset)
-            logger.info(f"Loaded qrels for {len(qrels)} queries from dataset")
+    # Load qrels - prioritize external source over dataset qrels
+    qrels = {}
+    if dev_qrels_file:
+        # Use the smart loader that handles both ir_datasets and TREC files
+        qrels = load_qrels_smart(dev_qrels_file, queries)
+    else:
+        # Fallback to dataset qrels
+        logger.info("No external qrels source provided, using dataset qrels...")
+        qrels_from_dataset = defaultdict(dict)
+        for qrel in dataset.qrels_iter():
+            if qrel.query_id in queries:
+                qrels_from_dataset[qrel.query_id][qrel.doc_id] = qrel.relevance
+        qrels = dict(qrels_from_dataset)
+        logger.info(f"Loaded qrels for {len(qrels)} queries from dataset")
 
-        # Load documents
-        document_loader = DocumentLoader(dataset=dataset)
+    # Load documents
+    document_loader = DocumentLoader(dataset=dataset)
 
-        return queries, qrels, document_loader
+    return queries, qrels, document_loader
 
 
 def validate_training_data(data: List[Dict]) -> Dict[str, Any]:
-    """Validate training data has required fields."""
-    total_examples = len(data)
-    queries_with_doc_text = 0
-    total_candidates = 0
-    candidates_with_doc_text = 0
-
-    for example in data:
-        has_doc_text = False
-        for candidate in example.get('candidates', []):
-            total_candidates += 1
-            if 'doc_text' in candidate:
-                candidates_with_doc_text += 1
-                has_doc_text = True
-        if has_doc_text:
-            queries_with_doc_text += 1
-
-    stats = {
-        'total_queries': total_examples,
-        'queries_with_doc_text': queries_with_doc_text,
-        'total_candidates': total_candidates,
-        'candidates_with_doc_text': candidates_with_doc_text,
-        'query_coverage': queries_with_doc_text / total_examples if total_examples > 0 else 0,
-        'candidate_coverage': candidates_with_doc_text / total_candidates if total_candidates > 0 else 0
-    }
-
-    return stats
     """Validate training data has required fields."""
     total_examples = len(data)
     queries_with_doc_text = 0
@@ -341,7 +357,7 @@ def main():
     parser.add_argument('--val-file', type=str,
                         help='Path to validation.jsonl file')
     parser.add_argument('--dev-qrels', type=str,
-                        help='Path to dev qrels file (TREC format) for evaluation')
+                        help='Dev qrels source: either ir_datasets dataset name or path to TREC format qrels file')
     parser.add_argument('--dataset', type=str,
                         help='Dataset name for loading documents (optional)')
     parser.add_argument('--output-dir', type=str, required=True,
@@ -350,7 +366,6 @@ def main():
     parser.add_argument('--ablation-mode', type=str, default='both',
                         choices=['both', 'rm3_only', 'cosine_only'],
                         help='Ablation mode: both components, RM3 only, or cosine similarity only')
-
 
     # Model arguments
     parser.add_argument('--model-name', type=str, default='all-MiniLM-L6-v2',
@@ -447,24 +462,19 @@ def main():
                 if not args.dev_qrels:
                     logger.error(
                         "--dev-qrels is required when --val-file is provided (unless --disable-dev-eval is used)")
-                    logger.error("Please provide path to dev qrels file in TREC format")
+                    logger.error("Please provide either an ir_datasets dataset name or path to TREC format qrels file")
                     sys.exit(1)
 
-                dev_qrels_path = Path(args.dev_qrels)
-                if not dev_qrels_path.exists():
-                    logger.error(f"Dev qrels file not found: {dev_qrels_path}")
-                    sys.exit(1)
-
-                # Load evaluation components
+                # Load evaluation components - let load_qrels_smart handle validation
                 if args.dataset:
                     # Load from dataset with external qrels
                     queries, qrels, document_loader = load_evaluation_data_from_dataset(
-                        args.dataset, Path(args.val_file), dev_qrels_path
+                        args.dataset, Path(args.val_file), args.dev_qrels
                     )
                 else:
                     # Load from JSONL with external qrels
                     queries, qrels, document_loader = load_evaluation_data_from_jsonl(
-                        Path(args.val_file), dev_qrels_path, args.dataset
+                        Path(args.val_file), args.dev_qrels, args.dataset
                     )
 
                 logger.info(f"Evaluation setup:")
