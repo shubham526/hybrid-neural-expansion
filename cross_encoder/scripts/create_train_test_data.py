@@ -278,7 +278,17 @@ class TrainTestDataCreator:
         # Load first-stage runs
         first_stage_runs = defaultdict(list)
 
-        if dataset.has_scoreddocs():
+        if run_file_path:
+            logger.info(f"Loading first-stage runs from: {run_file_path}")
+            run_data = load_trec_run(run_file_path)
+
+            # Filter to subset if specified
+            if query_subset:
+                run_data = {qid: docs for qid, docs in run_data.items()
+                            if qid in query_subset}
+
+            first_stage_runs.update(run_data)
+        elif dataset.has_scoreddocs():
             logger.info("Using dataset scoreddocs for first-stage runs")
             for sdoc in dataset.scoreddocs_iter():
                 # Filter to subset if specified
@@ -289,17 +299,6 @@ class TrainTestDataCreator:
             # Sort by score (descending)
             for qid in first_stage_runs:
                 first_stage_runs[qid].sort(key=lambda x: x[1], reverse=True)
-
-        elif run_file_path:
-            logger.info(f"Loading first-stage runs from: {run_file_path}")
-            run_data = load_trec_run(run_file_path)
-
-            # Filter to subset if specified
-            if query_subset:
-                run_data = {qid: docs for qid, docs in run_data.items()
-                            if qid in query_subset}
-
-            first_stage_runs.update(run_data)
 
         else:
             raise ValueError("Need either dataset with scoreddocs or --run-file-path")
