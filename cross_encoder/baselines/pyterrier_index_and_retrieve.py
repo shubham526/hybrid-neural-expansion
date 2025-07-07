@@ -4,31 +4,248 @@ PyTerrier Index and Retrieve Script
 
 This script can index documents and perform retrieval using BM25 on BEIR datasets.
 Supports beir/dbpedia-entity and beir/nq datasets.
+Now supports custom queries from TSV files.
 
 Usage:
     # Index a dataset
     python pyterrier_script.py --mode index --dataset beir/dbpedia-entity --index_path ./dbpedia-index
 
-    # Retrieve from indexed dataset
+    # Retrieve from indexed dataset using dataset queries
     python pyterrier_script.py --mode retrieve --dataset beir/dbpedia-entity --index_path ./dbpedia-index --output_file run.txt
 
-    # Index and then retrieve
-    python pyterrier_script.py --mode both --dataset beir/nq --index_path ./nq-index --output_file run.txt
+    # Retrieve using custom queries from TSV file
+    python pyterrier_script.py --mode retrieve --dataset beir/dbpedia-entity --index_path ./dbpedia-index --output_file run.txt --queries_file queries.tsv
+
+    # Index and then retrieve with custom queries
+    python pyterrier_script.py --mode both --dataset beir/nq --index_path ./nq-index --output_file run.txt --queries_file my_queries.tsv
 """
 
 import argparse
 import os
 import sys
 import time
+import pandas as pd
 from pathlib import Path
 
 try:
     import pyterrier as pt
-    import pandas as pd
+    from tqdm import tqdm
 except ImportError as e:
     print(f"Error importing required packages: {e}")
-    print("Please install: pip install python-terrier pandas")
+    print("Please install: pip install python-terrier pandas tqdm")
     sys.exit(1)
+
+
+def preprocess_queries(queries_df):
+    """
+    Preprocess queries to handle special characters that cause parsing errors.
+
+    Args:
+        queries_df: DataFrame with 'qid' and 'query' columns
+
+    Returns:
+        DataFrame with cleaned queries
+    """
+
+    def clean_query(query_text):
+        """Clean individual query text"""
+        if pd.isna(query_text):
+            return ""
+
+        # Convert to string
+        query = str(query_text)
+
+        # More aggressive cleaning for Terrier compatibility
+        import re
+
+        # Remove all punctuation except spaces, hyphens, and periods in numbers
+        # Keep only: letters, numbers, spaces, hyphens
+        query = re.sub(r'[^\w\s\-]', ' ', query)
+
+        # Replace multiple spaces with single space
+        query = re.sub(r'\s+', ' ', query)
+
+        # Remove leading/trailing whitespace
+        query = query.strip()
+
+        # Ensure query is not empty
+        if not query:
+            return "empty query"
+
+        return query
+
+    print("Preprocessing queries for Terrier compatibility...")
+
+    # Store original queries for logging
+    original_queries = queries_df['query'].tolist()
+
+    # Clean queries
+    queries_df = queries_df.copy()
+    queries_df['query'] = queries_df['query'].apply(clean_query)
+
+    # Log changes
+    changes_count = 0
+    for i, (orig, cleaned) in enumerate(zip(original_queries, queries_df['query'].tolist())):
+        if orig != cleaned:
+            changes_count += 1
+            if changes_count <= 5:  # Show first 5 changes
+                qid = queries_df.iloc[i]['qid']
+                print(f"  Query {qid}: '{orig}' → '{cleaned}'")
+
+    if changes_count > 5:
+        print(f"  ... and {changes_count - 5} more queries were cleaned")
+    elif changes_count > 0:
+        print(f"  Total queries cleaned: {changes_count}")
+    else:
+        print("  No queries needed cleaning")
+
+    return queries_df
+
+
+def load_queries_from_tsv(queries_file):
+    """
+    Load queries from TSV file.
+
+    Supports files with or without headers.
+    Expected formats:
+    1. No header: qid\tquery (first column = qid, second column = query)
+    2. With header: any column names, auto-detected
+    3. Single column: treats as query with auto-generated qids
+
+    Args:
+        queries_file: Path to TSV file
+
+    Returns:
+        pandas DataFrame with 'qid' and 'query' columns
+    """
+    try:
+        print(f"Loading queries from: {queries_file}")
+
+        # First, try to detect if file has headers by reading first few lines
+        with open(queries_file, 'r', encoding='utf-8') as f:
+            first_line = f.readline().strip()
+            second_line = f.readline().strip() if f else ""
+
+        # Split by tab to see structure
+        first_parts = first_line.split('\t')
+        second_parts = second_line.split('\t') if second_line else []
+
+        print(f"First line: {len(first_parts)} columns")
+        print(f"Second line: {len(second_parts)} columns")
+
+        # Heuristic to detect headers:
+        # If first line contains common header words, assume it has headers
+        header_keywords = ['qid', 'query', 'id', 'text', 'question', 'title', 'queryid', 'query_id']
+        has_headers = any(keyword.lower() in first_line.lower() for keyword in header_keywords)
+
+        if has_headers:
+            print("Detected headers in file")
+            # Read with headers
+            df = pd.read_csv(queries_file, sep='\t', dtype=str)
+
+            print(f"TSV shape: {df.shape}")
+            print(f"Columns: {list(df.columns)}")
+
+            # Auto-detect column names
+            qid_col = None
+            query_col = None
+
+            # Look for qid column (case insensitive)
+            for col in df.columns:
+                if col.lower() in ['qid', 'query_id', 'id', 'queryid']:
+                    qid_col = col
+                    break
+
+            # Look for query column (case insensitive)
+            for col in df.columns:
+                if col.lower() in ['query', 'text', 'query_text', 'question']:
+                    query_col = col
+                    break
+
+            if qid_col is None:
+                # If no clear qid column, use first column
+                qid_col = df.columns[0]
+                print(f"Warning: No clear qid column found, using first column: {qid_col}")
+
+            if query_col is None:
+                # If no clear query column, use second column
+                if len(df.columns) > 1:
+                    query_col = df.columns[1]
+                    print(f"Warning: No clear query column found, using second column: {query_col}")
+                else:
+                    raise ValueError("Could not find query column in TSV file")
+
+            print(f"Using columns: qid='{qid_col}', query='{query_col}'")
+
+            # Create standardized dataframe
+            queries_df = pd.DataFrame({
+                'qid': df[qid_col].astype(str),
+                'query': df[query_col].astype(str)
+            })
+
+        else:
+            print("No headers detected, assuming first column = qid, second column = query")
+
+            # Read without headers
+            df = pd.read_csv(queries_file, sep='\t', header=None, dtype=str)
+
+            print(f"TSV shape: {df.shape}")
+            print(f"Columns: {len(df.columns)}")
+
+            if len(df.columns) == 1:
+                # Single column - treat as queries with auto-generated IDs
+                print("Single column detected, generating automatic qids")
+                queries_df = pd.DataFrame({
+                    'qid': [f"q{i + 1}" for i in range(len(df))],
+                    'query': df[0].astype(str)
+                })
+            elif len(df.columns) >= 2:
+                # Multiple columns - use first as qid, second as query
+                print("Multiple columns detected, using first=qid, second=query")
+                queries_df = pd.DataFrame({
+                    'qid': df[0].astype(str),
+                    'query': df[1].astype(str)
+                })
+            else:
+                raise ValueError("Empty or invalid TSV file")
+
+        # Remove any rows with missing values
+        original_len = len(queries_df)
+        queries_df = queries_df.dropna()
+        if len(queries_df) < original_len:
+            print(f"Warning: Removed {original_len - len(queries_df)} rows with missing values")
+
+        # Remove empty queries
+        queries_df = queries_df[queries_df['query'].str.strip() != '']
+        if len(queries_df) < original_len:
+            print(f"Warning: Removed {original_len - len(queries_df)} rows with empty queries")
+
+        # Preprocess queries to handle special characters
+        queries_df = preprocess_queries(queries_df)
+
+        print(f"Loaded {len(queries_df)} queries successfully")
+
+        # Show sample queries
+        print("\nSample queries from TSV:")
+        for i, row in queries_df.head(3).iterrows():
+            print(f"  {row['qid']}: {row['query']}")
+
+        return queries_df
+
+    except Exception as e:
+        print(f"Error loading queries from TSV file: {e}")
+        print("\nExpected TSV formats:")
+        print("\n1. Without headers:")
+        print("1\\tWhat is the capital of France?")
+        print("2\\tHow does photosynthesis work?")
+        print("\n2. With headers:")
+        print("qid\\tquery")
+        print("1\\tWhat is the capital of France?")
+        print("2\\tHow does photosynthesis work?")
+        print("\n3. Single column (auto-generated IDs):")
+        print("What is the capital of France?")
+        print("How does photosynthesis work?")
+        sys.exit(1)
 
 
 class PyTerrierProcessor:
@@ -221,14 +438,15 @@ class PyTerrierProcessor:
             print(f"Error setting up retriever: {e}")
             return None
 
-    def retrieve_queries(self, output_file, run_name="BM25_run", custom_queries=None):
+    def retrieve_queries(self, output_file, run_name="BM25_run", custom_queries=None, queries_file=None):
         """
-        Perform retrieval on dataset queries
+        Perform retrieval on dataset queries with progress tracking
 
         Args:
             output_file: Output file for TREC run
             run_name: Name for the run
             custom_queries: Optional custom queries DataFrame
+            queries_file: Optional path to TSV file with queries
         """
         try:
             if self.retriever is None:
@@ -236,49 +454,90 @@ class PyTerrierProcessor:
                 if self.retriever is None:
                     return
 
-            # Get queries
+            # Get queries (priority: custom_queries > queries_file > dataset queries)
             if custom_queries is not None:
                 queries = custom_queries
-                print(f"Using {len(queries)} custom queries")
+                print(f"Using {len(queries)} custom queries from DataFrame")
+            elif queries_file is not None:
+                queries = load_queries_from_tsv(queries_file)
+                print(f"Using {len(queries)} queries from TSV file: {queries_file}")
             else:
                 print("Loading dataset queries...")
                 queries = self.dataset.get_topics()
                 print(f"Loaded {len(queries)} queries from dataset")
 
             # Display sample queries
-            print("\nSample queries:")
+            print("\nSample queries for retrieval:")
             for i, row in queries.head(3).iterrows():
                 qid = row.get('qid', row.get('query_id', 'unknown'))
                 query_text = row.get('query', row.get('text', 'unknown'))
                 print(f"  {qid}: {query_text}")
 
-            print(f"\nStarting retrieval...")
+            print(f"\nStarting retrieval for {len(queries)} queries...")
             start_time = time.time()
 
-            # Perform retrieval
-            results = self.retriever.transform(queries)
+            # Create progress bar
+            progress_bar = tqdm(
+                total=len(queries),
+                desc="Processing queries",
+                unit="query",
+                ncols=100,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} queries [{elapsed}<{remaining}, {rate_fmt}]"
+            )
+
+            # Process queries in batches to show progress
+            batch_size = max(1, len(queries) // 20)  # 20 updates for the progress bar
+            all_results = []
+
+            try:
+                for i in range(0, len(queries), batch_size):
+                    batch_queries = queries.iloc[i:i + batch_size]
+
+                    # Perform retrieval on this batch
+                    batch_results = self.retriever.transform(batch_queries)
+                    all_results.append(batch_results)
+
+                    # Update progress bar
+                    progress_bar.update(len(batch_queries))
+
+                    # Optional: Show current query being processed
+                    if len(batch_queries) > 0:
+                        current_qid = batch_queries.iloc[0].get('qid', 'unknown')
+                        progress_bar.set_postfix({"Current": current_qid})
+
+                # Combine all results
+                if all_results:
+                    results = pd.concat(all_results, ignore_index=True)
+                else:
+                    results = pd.DataFrame()
+
+            finally:
+                progress_bar.close()
 
             end_time = time.time()
-            print(f"Retrieval completed in {end_time - start_time:.2f} seconds")
+            print(f"\nRetrieval completed in {end_time - start_time:.2f} seconds")
 
             # Display results summary
-            print(f"\nResults summary:")
-            print(f"  Total query-document pairs: {len(results):,}")
-            print(f"  Unique queries: {results['qid'].nunique()}")
-            print(f"  Average results per query: {len(results) / results['qid'].nunique():.1f}")
+            if len(results) > 0:
+                print(f"\nResults summary:")
+                print(f"  Total query-document pairs: {len(results):,}")
+                print(f"  Unique queries: {results['qid'].nunique()}")
+                print(f"  Average results per query: {len(results) / results['qid'].nunique():.1f}")
 
-            # Show sample results
-            print(f"\nSample results:")
-            sample_results = results.head(5)
-            for _, row in sample_results.iterrows():
-                print(f"  Query {row['qid']}: Doc {row['docno']} (rank {row['rank']}, score {row['score']:.4f})")
+                # Show sample results
+                print(f"\nSample results:")
+                sample_results = results.head(5)
+                for _, row in sample_results.iterrows():
+                    print(f"  Query {row['qid']}: Doc {row['docno']} (rank {row['rank']}, score {row['score']:.4f})")
 
-            # Save results
-            print(f"\nSaving results to: {output_file}")
-            Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+                # Save results
+                print(f"\nSaving results to: {output_file}")
+                Path(output_file).parent.mkdir(parents=True, exist_ok=True)
 
-            pt.io.write_results(results, output_file, format="trec", run_name=run_name)
-            print(f"TREC run file saved successfully")
+                pt.io.write_results(results, output_file, format="trec", run_name=run_name)
+                print(f"TREC run file saved successfully")
+            else:
+                print("\nWarning: No results generated!")
 
             return results
 
@@ -320,44 +579,48 @@ class PyTerrierProcessor:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='PyTerrier Index and Retrieve Script')
+    parser = argparse.ArgumentParser(description='PyTerrier Index and Retrieve Script with Custom Queries Support')
 
     # Required arguments
     parser.add_argument('--mode', required=True, choices=['index', 'retrieve', 'both', 'search'],
                         help='Mode: index, retrieve, both, or search')
-    parser.add_argument('--qe-method', choices=['none', 'bo1', 'rm3', 'kl'], default='none',
-                        help='Query expansion method: none, bo1, rm3, or kl')
     parser.add_argument('--dataset', required=True,
-                        # choices=['beir/dbpedia-entity', 'beir/nq', 'beir/hotpotqa'],
-                        help='Dataset to use')
+                        help='Dataset to use (e.g., beir/dbpedia-entity, beir/nq)')
     parser.add_argument('--index-path', required=True, help='Path for the index')
 
     # Optional arguments
     parser.add_argument('--output-file', help='Output TREC run file (required for retrieve/both modes)')
+    parser.add_argument('--queries-file', help='Path to TSV file containing custom queries (qid, query)')
     parser.add_argument('--run-name', default='BM25_run', help='Run name for TREC file')
     parser.add_argument('--overwrite', action='store_true', help='Overwrite existing index')
     parser.add_argument('--num-results', type=int, default=1000, help='Number of results per query')
     parser.add_argument('--query', help='Single query for search mode')
 
-    # BM25 parameters
-    parser.add_argument('--k1', type=float, default=1.2, help='BM25 k1 parameter')
-    parser.add_argument('--b', type=float, default=0.75, help='BM25 b parameter')
-
     # Query expansion parameters
+    parser.add_argument('--qe-method', choices=['none', 'bo1', 'rm3', 'kl'], default='none',
+                        help='Query expansion method: none, bo1, rm3, or kl')
     parser.add_argument('--qe-terms', type=int, default=10, help='Number of expansion terms (default: 10)')
     parser.add_argument('--qe-docs', type=int, default=3, help='Number of feedback documents (default: 3)')
     parser.add_argument('--fb-lambda', type=float, default=0.5, help='Feedback lambda for RM3 (default: 0.5)')
     parser.add_argument('--fb-mu', type=float, default=500, help='Feedback mu for KL (default: 500)')
 
+    # BM25 parameters
+    parser.add_argument('--k1', type=float, default=1.2, help='BM25 k1 parameter')
+    parser.add_argument('--b', type=float, default=0.75, help='BM25 b parameter')
+
     args = parser.parse_args()
 
     # Validate arguments
     if args.mode in ['retrieve', 'both'] and not args.output_file:
-        print("Error: --output_file is required for retrieve and both modes")
+        print("Error: --output-file is required for retrieve and both modes")
         sys.exit(1)
 
     if args.mode == 'search' and not args.query:
         print("Error: --query is required for search mode")
+        sys.exit(1)
+
+    if args.queries_file and not os.path.exists(args.queries_file):
+        print(f"Error: Queries file not found: {args.queries_file}")
         sys.exit(1)
 
     # Initialize processor
@@ -384,7 +647,11 @@ def main():
                 k1=args.k1,
                 b=args.b
             )
-            processor.retrieve_queries(args.output_file, args.run_name)
+            processor.retrieve_queries(
+                output_file=args.output_file,
+                run_name=args.run_name,
+                queries_file=args.queries_file
+            )
 
         elif args.mode == 'both':
             print("=== INDEX AND RETRIEVE MODE ===")
@@ -402,7 +669,11 @@ def main():
                 k1=args.k1,
                 b=args.b
             )
-            processor.retrieve_queries(args.output_file, args.run_name)
+            processor.retrieve_queries(
+                output_file=args.output_file,
+                run_name=args.run_name,
+                queries_file=args.queries_file
+            )
 
         elif args.mode == 'search':
             print("=== SEARCH MODE ===")
