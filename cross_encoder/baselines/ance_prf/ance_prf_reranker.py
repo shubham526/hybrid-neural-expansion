@@ -18,7 +18,7 @@ from collections import defaultdict
 import torch
 import numpy as np
 import ir_datasets
-from transformers import RobertaTokenizer, RobertaConfig
+from transformers import RobertaTokenizer, RobertaConfig, AutoTokenizer
 from tqdm import tqdm
 
 # Import from the existing codebase
@@ -107,16 +107,76 @@ class ANCEPRFModel:
         self.doc_processor = None
         self._load_model()
 
+    def _load_tokenizer(self):
+        """Load tokenizer with fallback options."""
+        logger.info(f"Loading tokenizer from {self.checkpoint_path}")
+
+        # Check if tokenizer files exist in checkpoint
+        tokenizer_files = ['vocab.json', 'merges.txt', 'tokenizer.json']
+        checkpoint_has_tokenizer = any(
+            os.path.exists(os.path.join(self.checkpoint_path, f)) for f in tokenizer_files
+        )
+
+        if checkpoint_has_tokenizer:
+            try:
+                logger.info("Attempting to load tokenizer from checkpoint directory...")
+                self.tokenizer = RobertaTokenizer.from_pretrained(self.checkpoint_path)
+                logger.info("Successfully loaded tokenizer from checkpoint")
+                return
+            except Exception as e:
+                logger.warning(f"Failed to load tokenizer from checkpoint: {e}")
+
+        # Fallback options
+        fallback_tokenizers = [
+            'roberta-base',
+            'microsoft/roberta-base',
+            'sentence-transformers/msmarco-roberta-base-ance-firstp'
+        ]
+
+        for tokenizer_name in fallback_tokenizers:
+            try:
+                logger.info(f"Trying fallback tokenizer: {tokenizer_name}")
+                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+                logger.info(f"Successfully loaded fallback tokenizer: {tokenizer_name}")
+                return
+            except Exception as e:
+                logger.warning(f"Failed to load {tokenizer_name}: {e}")
+
+        raise RuntimeError(
+            "Could not load any tokenizer. Please ensure you have internet connection or the checkpoint contains tokenizer files.")
+
     def _load_model(self):
         """Load model and tokenizer from checkpoint."""
         logger.info(f"Loading ANCE-PRF model from {self.checkpoint_path}")
 
-        # Load tokenizer
-        self.tokenizer = RobertaTokenizer.from_pretrained(self.checkpoint_path)
+        # Load tokenizer with fallback
+        self._load_tokenizer()
 
         # Load model config and weights
-        config = RobertaConfig.from_pretrained(self.checkpoint_path)
-        self.model = RobertaDot_NLL_LN.from_pretrained(self.checkpoint_path, config=config)
+        try:
+            config = RobertaConfig.from_pretrained(self.checkpoint_path)
+            logger.info("Loaded config from checkpoint")
+        except Exception as e:
+            logger.warning(f"Failed to load config from checkpoint: {e}")
+            logger.info("Using default RoBERTa config")
+            config = RobertaConfig.from_pretrained('roberta-base')
+
+        # Load model
+        try:
+            self.model = RobertaDot_NLL_LN.from_pretrained(self.checkpoint_path, config=config)
+            logger.info("Successfully loaded model from checkpoint")
+        except Exception as e:
+            logger.error(f"Failed to load model from checkpoint: {e}")
+            # Try loading just the state dict
+            try:
+                self.model = RobertaDot_NLL_LN(config)
+                checkpoint = torch.load(os.path.join(self.checkpoint_path, 'pytorch_model.bin'), map_location='cpu')
+                self.model.load_state_dict(checkpoint)
+                logger.info("Successfully loaded model state dict")
+            except Exception as e2:
+                logger.error(f"Failed to load model state dict: {e2}")
+                raise RuntimeError(f"Could not load model from {self.checkpoint_path}")
+
         self.model.to(self.device)
         self.model.eval()
 
@@ -139,19 +199,32 @@ class ANCEPRFModel:
             query_emb = self.model.query_emb(**inputs)
             return query_emb.cpu().numpy()
 
-    def encode_documents(self, documents: List[str]) -> np.ndarray:
-        """Encode a batch of documents."""
+    def encode_documents(self, documents: List[str], batch_size: int = 32, show_progress: bool = True) -> np.ndarray:
+        """Encode a batch of documents efficiently."""
+        if not documents:
+            return np.array([]).reshape(0, -1)
+
         embeddings = []
 
-        for doc in tqdm(documents, desc="Encoding documents"):
-            inputs = self.doc_processor.process_document(doc)
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        # Process in batches for efficiency
+        progress_bar = tqdm(range(0, len(documents), batch_size), desc="Encoding documents", disable=not show_progress)
 
-            with torch.no_grad():
-                doc_emb = self.model.body_emb(**inputs)
-                embeddings.append(doc_emb.cpu().numpy())
+        for i in progress_bar:
+            batch_docs = documents[i:i + batch_size]
+            batch_embeddings = []
 
-        return np.vstack(embeddings)
+            for doc in batch_docs:
+                inputs = self.doc_processor.process_document(doc)
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+                with torch.no_grad():
+                    doc_emb = self.model.body_emb(**inputs)
+                    batch_embeddings.append(doc_emb.cpu().numpy())
+
+            if batch_embeddings:
+                embeddings.extend(batch_embeddings)
+
+        return np.vstack(embeddings) if embeddings else np.array([]).reshape(0, -1)
 
 
 class IRDatasetHandler:
@@ -514,53 +587,98 @@ class ANCEPRFReranker:
                    run_path: str,
                    output_path: str,
                    use_prf: bool = True,
-                   rerank_depth: int = 100) -> None:
+                   rerank_depth: int = 100,
+                   similarity_metric: str = "dot_product") -> None:
         """Rerank a TREC run file and save results."""
 
         # Load run file
         run_loader = TRECRunLoader(run_path)
 
+        logger.info(f"Loaded run file with {len(run_loader.run_data)} queries")
+
+        # Collect all unique documents to encode them once
+        all_doc_ids = set()
+        query_doc_mapping = {}
+
+        for qid in run_loader.run_data.keys():
+            doc_ids = run_loader.get_query_docs(qid, rerank_depth)
+            query_doc_mapping[qid] = doc_ids
+            all_doc_ids.update(doc_ids)
+
+        logger.info(f"Found {len(all_doc_ids)} unique documents to encode")
+
+        # Get document texts for all unique documents
+        all_doc_ids_list = list(all_doc_ids)
+        all_doc_texts = self.dataset_handler.get_documents_text(all_doc_ids_list)
+
+        # Create mapping from doc_id to text and embedding index
+        doc_id_to_text = {}
+        doc_id_to_idx = {}
+        valid_docs = []
+        valid_doc_ids = []
+
+        for i, (doc_id, doc_text) in enumerate(zip(all_doc_ids_list, all_doc_texts)):
+            if doc_text.strip():
+                doc_id_to_text[doc_id] = doc_text
+                doc_id_to_idx[doc_id] = len(valid_docs)
+                valid_docs.append(doc_text)
+                valid_doc_ids.append(doc_id)
+
+        logger.info(f"Encoding {len(valid_docs)} valid documents...")
+
+        # Encode all documents once
+        all_doc_embeddings = self.model.encode_documents(valid_docs, show_progress=True)
+
+        logger.info("Starting query processing...")
+
         # Process each query
         reranked_results = {}
 
-        for qid in tqdm(run_loader.run_data.keys(), desc="Reranking queries"):
+        for qid in tqdm(run_loader.run_data.keys(), desc="Processing queries"):
             query_text = self.dataset_handler.get_query_text(qid)
             if not query_text:
                 logger.warning(f"Query {qid} not found in dataset")
                 continue
 
-            # Get documents to rerank
-            doc_ids = run_loader.get_query_docs(qid, rerank_depth)
-            doc_texts = self.dataset_handler.get_documents_text(doc_ids)
+            # Get documents for this query
+            doc_ids = query_doc_mapping[qid]
 
-            # Filter out empty documents
-            valid_docs = [(doc_id, doc_text) for doc_id, doc_text in zip(doc_ids, doc_texts)
-                          if doc_text.strip()]
+            # Filter to only valid documents and get their embeddings
+            query_doc_ids = []
+            query_doc_texts = []
+            query_doc_embeddings = []
 
-            if not valid_docs:
+            for doc_id in doc_ids:
+                if doc_id in doc_id_to_idx:
+                    query_doc_ids.append(doc_id)
+                    query_doc_texts.append(doc_id_to_text[doc_id])
+                    embedding_idx = doc_id_to_idx[doc_id]
+                    query_doc_embeddings.append(all_doc_embeddings[embedding_idx])
+
+            if not query_doc_ids:
                 logger.warning(f"No valid documents found for query {qid}")
                 continue
 
-            doc_ids, doc_texts = zip(*valid_docs)
-
             # Get PRF documents if enabled
             feedback_docs = None
-            if use_prf and len(doc_texts) >= self.num_feedback_docs:
-                feedback_docs = list(doc_texts[:self.num_feedback_docs])
+            if use_prf and len(query_doc_texts) >= self.num_feedback_docs:
+                feedback_docs = query_doc_texts[:self.num_feedback_docs]
 
-            # Encode query and documents
+            # Encode query (no progress bar needed for single query)
             query_emb = self.model.encode_query(query_text, feedback_docs)
-            doc_embs = self.model.encode_documents(list(doc_texts))
 
-            # Compute similarities using simple numpy operations (no FAISS needed)
-            similarities = self._compute_similarities(query_emb, doc_embs)
+            # Stack document embeddings for this query
+            doc_embs = np.vstack(query_doc_embeddings)
+
+            # Compute similarities
+            similarities = self._compute_similarities(query_emb, doc_embs, metric=similarity_metric)
 
             # Rank by similarity (highest first)
             ranked_indices = np.argsort(similarities)[::-1]
 
             # Store results
             reranked_results[qid] = [
-                (doc_ids[idx], similarities[idx])
+                (query_doc_ids[idx], similarities[idx])
                 for idx in ranked_indices
             ]
 
@@ -569,7 +687,7 @@ class ANCEPRFReranker:
         logger.info(f"Reranked results saved to {output_path}")
 
     def _compute_similarities(self, query_emb: np.ndarray, doc_embs: np.ndarray,
-                              metric: str = "cosine") -> np.ndarray:
+                              metric: str = "dot_product") -> np.ndarray:
         """Compute similarities between query and documents without FAISS."""
 
         if metric == "cosine":
@@ -618,6 +736,8 @@ def main():
     parser.add_argument("--no-prf", action="store_true", help="Disable pseudo relevance feedback")
     parser.add_argument("--cache-dir", help="Directory to cache dataset files")
     parser.add_argument("--lazy-loading", action="store_true", help="Enable lazy loading for large datasets")
+    parser.add_argument("--similarity", choices=["cosine", "dot_product", "euclidean"],
+                        default="dot_product", help="Similarity metric to use (default: dot_product for ANCE)")
     parser.add_argument("--inspect-dataset", action="store_true", help="Inspect dataset structure and exit")
     parser.add_argument("--list-datasets", action="store_true", help="List available ir_datasets and exit")
 
@@ -666,7 +786,8 @@ def main():
         run_path=args.run,
         output_path=args.output,
         use_prf=not args.no_prf,
-        rerank_depth=args.rerank_depth
+        rerank_depth=args.rerank_depth,
+        similarity_metric=args.similarity
     )
 
     print(f"Reranking completed. Results saved to {args.output}")

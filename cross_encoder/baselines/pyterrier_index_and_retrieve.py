@@ -26,6 +26,7 @@ import sys
 import time
 import pandas as pd
 from pathlib import Path
+import ir_datasets
 
 try:
     import pyterrier as pt
@@ -275,7 +276,7 @@ class PyTerrierProcessor:
         """Load the specified dataset"""
         try:
             print(f"Loading dataset: {self.dataset_name}")
-            self.dataset = pt.datasets.get_dataset(f'irds:{self.dataset_name}')
+            self.dataset = ir_datasets.load(self.dataset_name)
             print(f"Dataset loaded successfully")
         except Exception as e:
             print(f"Error loading dataset {self.dataset_name}: {e}")
@@ -284,7 +285,7 @@ class PyTerrierProcessor:
 
     def index_dataset(self, overwrite=True):
         """
-        Index the dataset documents
+        Index the dataset documents with text storage for neural rerankers
 
         Args:
             overwrite: Whether to overwrite existing index
@@ -301,17 +302,42 @@ class PyTerrierProcessor:
                 print(f"Index already exists at {self.index_path}. Use --overwrite to recreate.")
                 return
 
-            # Create indexer
-            indexer = pt.index.IterDictIndexer(self.index_path, overwrite=overwrite)
+            def ir_dataset_generate():
+                """Generator that yields documents in PyTerrier format with text storage."""
+                print("Generating documents from ir_datasets...")
 
-            # Get corpus iterator
-            corpus_iter = self.dataset.get_corpus_iter()
 
-            print("Starting indexing process...")
+                for doc in tqdm(self.dataset.docs_iter(), desc="Processing documents", total=self.dataset.docs_count()):
+
+                    # print(doc.doc_text)
+                    # print(doc.doc_id)
+
+
+                    # Extract document text using the same logic as IRDatasetHandler
+                    doc_text = self._extract_document_text_for_indexing(doc)
+
+                    if doc_text.strip():  # Only index non-empty documents
+                        yield {
+                            'docno': doc.doc_id,
+                            'text': doc_text
+                        }
+
+            # Create indexer with metadata storage for document text
+            print("Creating indexer with text storage...")
+            indexer = pt.index.IterDictIndexer(
+                self.index_path,
+                overwrite=overwrite,
+                meta={
+                    'docno': 64,  # Store document ID (up to 64 chars)
+                    'text': 8192  # Store full text (up to 8KB per document)
+                }
+            )
+
+            print("Starting indexing process with text storage...")
             start_time = time.time()
 
-            # Index the documents
-            index_ref = indexer.index(corpus_iter)
+            # Index the documents using our generator
+            index_ref = indexer.index(ir_dataset_generate())
 
             end_time = time.time()
             print(f"Indexing completed in {end_time - start_time:.2f} seconds")
@@ -326,11 +352,71 @@ class PyTerrierProcessor:
             print(f"  Number of tokens: {stats.getNumberOfTokens():,}")
             print(f"  Average document length: {stats.getAverageDocumentLength():.2f}")
 
+            # Test that text storage is working
+            print("\nTesting text storage...")
+            index_obj = pt.IndexFactory.of(index_ref)
+            meta_index = index_obj.getMetaIndex()
+
+            try:
+                if len(meta_index.getKeys())  > 0:
+                    print("✓ Metadata storage confirmed - document text will be available")
+
+                    # Show sample stored text
+                    sample_keys = ['docno', 'text']
+                    if stats.getNumberOfDocuments() > 0:
+                        try:
+                            sample_meta = meta_index.getItem('docno', 0)
+                            sample_text = meta_index.getItem('text', 0)
+                            print(f"  Sample document: {sample_meta}")
+                            print(f"  Sample text: {sample_text[:100]}...")
+                        except:
+                            print("  Could not retrieve sample text (may be normal)")
+                else:
+                    print("⚠ Warning: No metadata stored - text may not be available for reranking")
+            except:
+                print(" Error when accessing metadata storage")
+
             return index_ref
 
         except Exception as e:
             print(f"Error during indexing: {e}")
+            import traceback
+            traceback.print_exc()
             sys.exit(1)
+
+    def _extract_document_text_for_indexing(self, doc) -> str:
+        """
+        Extract text from document for indexing (similar to IRDatasetHandler but for indexing).
+
+        Args:
+            doc: Document object from ir_datasets
+
+        Returns:
+            Combined document text
+        """
+        text_parts = []
+
+        # Common document fields to check (in order of preference)
+        text_fields = ['title', 'text', 'body', 'content', 'abstract', 'summary']
+
+        for field in text_fields:
+            if hasattr(doc, field):
+                field_value = getattr(doc, field)
+                if field_value and str(field_value).strip():
+                    text_parts.append(str(field_value).strip())
+
+        # If no standard fields found, try to get any string attributes
+        if not text_parts:
+            for attr_name in dir(doc):
+                if not attr_name.startswith('_') and attr_name not in ['doc_id']:
+                    try:
+                        attr_value = getattr(doc, attr_name)
+                        if isinstance(attr_value, str) and attr_value.strip():
+                            text_parts.append(attr_value.strip())
+                    except:
+                        continue
+
+        return " ".join(text_parts) if text_parts else ""
 
     def load_index(self):
         """Load existing index"""
