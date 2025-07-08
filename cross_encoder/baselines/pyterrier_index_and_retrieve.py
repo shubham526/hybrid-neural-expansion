@@ -438,7 +438,8 @@ class PyTerrierProcessor:
             print(f"Error setting up retriever: {e}")
             return None
 
-    def retrieve_queries(self, output_file, run_name="BM25_run", custom_queries=None, queries_file=None):
+    def retrieve_queries(self, output_file, run_name="BM25_run", custom_queries=None, queries_file=None,
+                         query_field="title"):
         """
         Perform retrieval on dataset queries with progress tracking
 
@@ -447,6 +448,7 @@ class PyTerrierProcessor:
             run_name: Name for the run
             custom_queries: Optional custom queries DataFrame
             queries_file: Optional path to TSV file with queries
+            query_field: Which field to use for dataset queries ('title', 'description', 'narrative', or 'auto')
         """
         try:
             if self.retriever is None:
@@ -465,6 +467,45 @@ class PyTerrierProcessor:
                 print("Loading dataset queries...")
                 queries = self.dataset.get_topics()
                 print(f"Loaded {len(queries)} queries from dataset")
+
+                # Handle multiple query fields in dataset
+                if 'query' not in queries.columns:
+                    available_fields = [col for col in queries.columns if
+                                        col in ['title', 'description', 'narrative', 'text']]
+                    print(f"Available query fields: {available_fields}")
+
+                    if query_field == "auto":
+                        # Auto-select the best field
+                        if 'title' in available_fields:
+                            query_field = 'title'
+                        elif 'description' in available_fields:
+                            query_field = 'description'
+                        elif 'text' in available_fields:
+                            query_field = 'text'
+                        else:
+                            query_field = available_fields[0]
+
+                    if query_field not in available_fields:
+                        print(f"Error: Requested query field '{query_field}' not available.")
+                        print(f"Available fields: {available_fields}")
+                        return None
+
+                    print(f"Using query field: '{query_field}'")
+
+                    # Create a copy with standardized 'query' column
+                    queries = queries.copy()
+                    queries['query'] = queries[query_field]
+
+                    # Ensure we have a 'qid' column
+                    if 'qid' not in queries.columns:
+                        if 'query_id' in queries.columns:
+                            queries['qid'] = queries['query_id']
+                        else:
+                            queries = queries.reset_index()
+                            queries['qid'] = queries.index.astype(str)
+
+            if queries_file is None:  # Only preprocess if not already done by load_queries_from_tsv
+                queries = preprocess_queries(queries)
 
             # Display sample queries
             print("\nSample queries for retrieval:")
@@ -595,6 +636,8 @@ def main():
     parser.add_argument('--overwrite', action='store_true', help='Overwrite existing index')
     parser.add_argument('--num-results', type=int, default=1000, help='Number of results per query')
     parser.add_argument('--query', help='Single query for search mode')
+    parser.add_argument('--query-field', choices=['title', 'description', 'narrative', 'auto'],
+                        default='auto', help='Query field to use from dataset (default: auto)')
 
     # Query expansion parameters
     parser.add_argument('--qe-method', choices=['none', 'bo1', 'rm3', 'kl'], default='none',
@@ -650,7 +693,8 @@ def main():
             processor.retrieve_queries(
                 output_file=args.output_file,
                 run_name=args.run_name,
-                queries_file=args.queries_file
+                queries_file=args.queries_file,
+                query_field=args.query_field
             )
 
         elif args.mode == 'both':
@@ -672,7 +716,8 @@ def main():
             processor.retrieve_queries(
                 output_file=args.output_file,
                 run_name=args.run_name,
-                queries_file=args.queries_file
+                queries_file=args.queries_file,
+                query_field=args.query_field
             )
 
         elif args.mode == 'search':
