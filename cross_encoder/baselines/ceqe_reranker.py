@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
-CEQE Reranking System
+CEQE Reranking System - FIXED VERSION
 
 A modular system to rerank TREC run files using CEQE (Contextualized Embeddings for Query Expansion).
 Uses ir_datasets for document/query handling, following the same structure as ANCE-PRF.
+
+FIXES INCLUDED:
+- Inhomogeneous array shape errors
+- Unicode/non-ASCII text handling
+- Memory management improvements
+- Better error handling throughout
 """
 
 import os
@@ -14,6 +20,8 @@ import argparse
 import math
 import numpy as np
 import operator
+import unicodedata
+import re
 from typing import Dict, List, Tuple, Optional, Any
 from pathlib import Path
 from collections import defaultdict
@@ -49,6 +57,105 @@ class PoolingStrategy:
     REDUCE_MEAN = 2
 
 
+def clean_text(text: str) -> str:
+    """
+    Clean text by removing problematic characters and forcing it into ASCII.
+    This is safe for most standard BERT/ColBERT models.
+    """
+    if not text:
+        return ""
+
+    # Convert to string to be safe
+    text = str(text)
+
+    # Handle very long texts early
+    if len(text) > 100000:  # 100K char limit before cleaning
+        text = text[:100000]
+        logger.debug("Pre-truncated very long text before cleaning")
+
+    try:
+        # More robust unicode normalization
+        # NFKD decomposes characters (é → e + ´) and normalizes compatible chars
+        text = unicodedata.normalize('NFKD', text)
+
+        # Remove control characters first
+        # This removes things like null bytes, form feeds, etc.
+        text = ''.join(char for char in text if unicodedata.category(char)[0] != 'C')
+
+        # THE CORE FIX: Force into ASCII, removing non-ASCII chars
+        text = text.encode('ascii', 'ignore').decode('ascii')
+
+        # Clean up whitespace more thoroughly
+        # Replace any sequence of whitespace chars with single space
+        text = re.sub(r'\s+', ' ', text)
+
+        # Remove empty lines and excessive spacing
+        text = re.sub(r'\n\s*\n', '\n', text)  # Remove empty lines
+        text = re.sub(r'[ \t]+', ' ', text)  # Normalize spaces/tabs
+
+    except Exception as e:
+        logger.warning(f"Error in text cleaning: {e}, returning truncated original")
+        # Fallback: just truncate and basic cleanup
+        text = str(text)[:10000]
+        text = re.sub(r'\s+', ' ', text)
+
+    result = text.strip()
+
+    # Validate final result
+    if not result or len(result.strip()) < 3:
+        logger.debug("Text cleaning resulted in very short/empty text")
+        return ""
+
+    return result
+
+
+def preprocess_document_batch(doc_texts: List[str], max_doc_length: int = 5000) -> List[str]:
+    """
+    Preprocess a batch of documents to ensure they're all clean and manageable.
+    """
+    cleaned_docs = []
+
+    for i, doc_text in enumerate(doc_texts):
+        try:
+            # Clean the text
+            cleaned = clean_text(doc_text)
+
+            # Additional length check after cleaning
+            if len(cleaned) > max_doc_length:
+                cleaned = cleaned[:max_doc_length]
+                logger.debug(f"Post-cleaning truncation for doc {i}")
+
+            # Skip documents that are too short after cleaning
+            if len(cleaned.strip()) < 10:
+                logger.debug(f"Skipping very short document {i} after cleaning")
+                cleaned_docs.append("")  # Empty placeholder
+            else:
+                cleaned_docs.append(cleaned)
+
+        except Exception as e:
+            logger.warning(f"Failed to preprocess document {i}: {e}")
+            cleaned_docs.append("")  # Empty placeholder for failed docs
+
+    return cleaned_docs
+
+
+def validate_embeddings(embeddings, name="embeddings"):
+    """Helper function to validate and debug embedding shapes"""
+    logger.debug(f"\n=== {name} Shape Debug ===")
+    if isinstance(embeddings, list):
+        logger.debug(f"List length: {len(embeddings)}")
+        for i, emb in enumerate(embeddings[:3]):  # Check first 3
+            if isinstance(emb, np.ndarray):
+                logger.debug(f"  Item {i}: {emb.shape}")
+            elif isinstance(emb, list):
+                logger.debug(f"  Item {i}: list length {len(emb)}")
+                if emb and isinstance(emb[0], np.ndarray):
+                    logger.debug(f"    First subitem shape: {emb[0].shape}")
+    elif isinstance(embeddings, np.ndarray):
+        logger.debug(f"Numpy array shape: {embeddings.shape}")
+    logger.debug("=" * 30)
+
+
 class DocumentProcessor:
     """Handles document processing and tokenization for CEQE."""
 
@@ -58,7 +165,18 @@ class DocumentProcessor:
 
     def convert_example_to_feature(self, text: str, text_id: str, chunk: bool = True) -> Dict[str, Any]:
         """Convert text to features following original extract_features.py"""
-        tokens_a = self.tokenizer.tokenize(text)
+        # Clean text before tokenization
+        text = clean_text(text)
+        if not text:
+            # Return minimal valid feature for empty text
+            return self._get_minimal_features(text_id)
+
+        try:
+            tokens_a = self.tokenizer.tokenize(text)
+        except Exception as e:
+            logger.warning(f"Tokenization failed for {text_id}: {e}")
+            return self._get_minimal_features(text_id)
+
         tokens_b = None
 
         if not chunk:
@@ -80,7 +198,28 @@ class DocumentProcessor:
                 chunks_input_features.append(
                     self._get_input_features(chunked_tokens_a, tokens_b, text_id)
                 )
-            return chunks_input_features
+            return chunks_input_features if chunks_input_features else [self._get_minimal_features(text_id)]
+
+    def _get_minimal_features(self, text_id: str) -> Dict[str, Any]:
+        """Get minimal valid features for empty/problematic text"""
+        tokens = ["[CLS]", "[SEP]"]
+        input_ids = self.tokenizer.convert_tokens_to_ids(tokens)
+        input_mask = [1] * len(input_ids)
+        segment_ids = [0] * len(input_ids)
+
+        # Zero-pad up to the sequence length
+        padding = [0] * (self.max_seq_length - len(input_ids))
+        input_ids += padding
+        input_mask += padding
+        segment_ids += padding
+
+        return {
+            'input_ids': input_ids,
+            'input_mask': input_mask,
+            'segment_ids': segment_ids,
+            'input_tokens': tokens,
+            'id': text_id
+        }
 
     def _get_input_features(self, tokens_a: List[str], tokens_b: Optional[List[str]], text_id: str) -> Dict[str, Any]:
         """Get input features following original extract_features.py"""
@@ -93,7 +232,12 @@ class DocumentProcessor:
         else:
             segment_ids = [0] * len(tokens)
 
-        input_ids = self.tokenizer.convert_tokens_to_ids(tokens)
+        try:
+            input_ids = self.tokenizer.convert_tokens_to_ids(tokens)
+        except Exception as e:
+            logger.warning(f"Token conversion failed for {text_id}: {e}")
+            return self._get_minimal_features(text_id)
+
         input_mask = [1] * len(input_ids)
 
         # Zero-pad up to the sequence length
@@ -152,7 +296,7 @@ class TRECRunLoader:
 
 
 class CEQEModel:
-    """CEQE model following the original implementation."""
+    """CEQE model following the original implementation - FIXED VERSION."""
 
     def __init__(self, model_name: str = "bert-base-uncased", max_seq_len: int = 128, device: str = 'cuda'):
         self.model_name = model_name
@@ -213,6 +357,9 @@ class CEQEModel:
 
     def get_embedding_matrix(self, input_features: List[Dict], pooling_strategy: int = PoolingStrategy.NONE):
         """Get embeddings following original graph.py"""
+        if not input_features:
+            return torch.empty(0, 768)  # Return empty tensor with correct shape
+
         input_ids = torch.tensor([f['input_ids'] for f in input_features], dtype=torch.long)
         input_mask = torch.tensor([f['input_mask'] for f in input_features], dtype=torch.long)
         segment_ids = torch.tensor([f['segment_ids'] for f in input_features], dtype=torch.long)
@@ -222,11 +369,17 @@ class CEQEModel:
         segment_ids = segment_ids.to(self.device)
 
         with torch.no_grad():
-            outputs = self.model(input_ids, token_type_ids=segment_ids, attention_mask=input_mask)
-            all_encoder_layers = outputs.hidden_states[:-1]  # Exclude last layer
+            try:
+                outputs = self.model(input_ids, token_type_ids=segment_ids, attention_mask=input_mask)
+                all_encoder_layers = outputs.hidden_states[:-1]  # Exclude last layer
 
-            # Use second to last layer (layer 11) as in original
-            encoder_layer = all_encoder_layers[-2]  # Second to last layer
+                # Use second to last layer (layer 11) as in original
+                encoder_layer = all_encoder_layers[-2]  # Second to last layer
+            except Exception as e:
+                logger.warning(f"Error in BERT forward pass: {e}")
+                # Return zero embeddings as fallback
+                batch_size = input_ids.shape[0]
+                return torch.zeros(batch_size, self.max_seq_len, 768).to(self.device)
 
         minus_mask = lambda x, m: x - (1.0 - m.unsqueeze(-1)) * 1e5
         mul_mask = lambda x, m: x * m.unsqueeze(-1)
@@ -253,7 +406,11 @@ class CEQEModel:
                 if np.array_equal(k, np.zeros(embedding_matrix_i.shape[1])):
                     break
                 embedding_matrix_i_non_zero.append(k)
-            embedding_matrix_non_zero.append(np.array(embedding_matrix_i_non_zero))
+            if embedding_matrix_i_non_zero:  # Only add if not empty
+                embedding_matrix_non_zero.append(np.array(embedding_matrix_i_non_zero))
+            else:
+                # Add minimal embedding for empty sequences
+                embedding_matrix_non_zero.append(np.zeros((1, embedding_matrix_i.shape[1])))
         return embedding_matrix_non_zero
 
     def get_terms(self, query_info):
@@ -262,10 +419,13 @@ class CEQEModel:
         queries_terms_embeds = [[] for i in range(len(query_info['id']))]
 
         for i in range(len(query_info['id'])):
-            q_tokens = query_info['tokens'][i]
-            q_embeds = query_info['embedding'][i]
+            q_tokens = query_info['tokens'][i] if i < len(query_info['tokens']) else []
+            q_embeds = query_info['embedding'][i] if i < len(query_info['embedding']) else []
 
-            for j in range(len(q_tokens)):
+            if not q_tokens or not len(q_embeds):
+                continue
+
+            for j in range(min(len(q_tokens), len(q_embeds))):
                 token = q_tokens[j]
                 token_embeds = np.array(q_embeds[j]).reshape(-1, len(q_embeds[j]))
 
@@ -293,54 +453,106 @@ class CEQEModel:
         return queries_terms, queries_terms_embeds
 
     def get_terms_embeds_pooled(self, queries_terms, queries_terms_embeds):
-        """Pool token embeddings to term embeddings following original"""
-        queries_terms_embeds_pooled = [[] for i in range(len(queries_terms_embeds))]
+        """Pool token embeddings to term embeddings - FIXED VERSION"""
+        queries_terms_embeds_pooled = []
 
         for i in range(len(queries_terms)):
             q_terms_embeds = queries_terms_embeds[i]
+            doc_terms_pooled = []
             for j in range(len(q_terms_embeds)):
-                queries_terms_embeds_pooled[i].append(np.mean(q_terms_embeds[j], axis=0))
+                # Pool each term's token embeddings
+                try:
+                    term_embedding = np.mean(q_terms_embeds[j], axis=0)
+                    doc_terms_pooled.append(term_embedding)
+                except Exception as e:
+                    logger.debug(f"Error pooling term {j}: {e}")
+                    # Use zero embedding as fallback
+                    if q_terms_embeds and len(q_terms_embeds) > 0:
+                        dim = q_terms_embeds[0].shape[-1] if len(q_terms_embeds[0].shape) > 0 else 768
+                    else:
+                        dim = 768
+                    doc_terms_pooled.append(np.zeros(dim))
+            queries_terms_embeds_pooled.append(doc_terms_pooled)
 
-        return np.array(queries_terms_embeds_pooled)
+        # Return as list, not numpy array to avoid shape issues
+        return queries_terms_embeds_pooled
 
     def get_similarity_query_and_docTerms_CAR(self, query_info, prf_docs_terms_info):
-        """Get similarity following original get_similarity.py"""
+        """Get similarity - FIXED VERSION"""
         similarity_q = {}
         q_id = query_info['id']
-        query_vec = np.array(query_info['embedding'])
+
+        # Ensure query_vec is properly shaped
+        if isinstance(query_info['embedding'], list):
+            query_vec = np.array(query_info['embedding'])
+        else:
+            query_vec = query_info['embedding']
+
+        # Flatten if needed
+        if query_vec.ndim > 1:
+            query_vec = query_vec.flatten()
 
         for doc_j in range(len(prf_docs_terms_info['id'])):
             doc_id = prf_docs_terms_info['id'][doc_j]
-            doc_terms_vec = np.array(prf_docs_terms_info['embedding'][doc_j])
+            doc_terms_embeds = prf_docs_terms_info['embedding'][doc_j]
 
-            for d_t in range(len(doc_terms_vec)):
+            # Handle each term embedding individually
+            for d_t in range(len(doc_terms_embeds)):
                 doc_term = prf_docs_terms_info['terms'][doc_j][d_t]
-                doc_term_vec = doc_terms_vec[d_t]
-                sim = 1 - spatial.distance.cosine(query_vec, doc_term_vec)
-                similarity_q.setdefault(doc_id, []).append((doc_term, sim))
+                doc_term_vec = np.array(doc_terms_embeds[d_t])
+
+                # Ensure proper shape for cosine similarity
+                if doc_term_vec.ndim > 1:
+                    doc_term_vec = doc_term_vec.flatten()
+
+                # Check if vectors have same dimension
+                if len(query_vec) == len(doc_term_vec):
+                    try:
+                        sim = 1 - spatial.distance.cosine(query_vec, doc_term_vec)
+                        similarity_q.setdefault(doc_id, []).append((doc_term, sim))
+                    except Exception as e:
+                        logger.debug(f"Similarity calculation error for {doc_term}: {e}")
+                        # Use default similarity if calculation fails
+                        similarity_q.setdefault(doc_id, []).append((doc_term, 0.0))
 
         return similarity_q
 
     def get_similarity_queryTerms_and_docsTerms_CAR(self, query_info, prf_docs_terms_info):
-        """Get similarity for query terms following original get_similarity.py"""
+        """Get similarity for query terms - FIXED VERSION"""
         similarity_q = {}
         q_id = query_info['id']
-        query_terms_vec = np.array(query_info['embedding'])
 
-        for q_t in range(len(query_terms_vec)):
-            term_vec = query_terms_vec[q_t]
+        # Handle query terms embeddings
+        query_terms_embeds = query_info['embedding']
+
+        for q_t in range(len(query_terms_embeds)):
+            term_vec = np.array(query_terms_embeds[q_t])
+            if term_vec.ndim > 1:
+                term_vec = term_vec.flatten()
+
             q_t_mention = query_info['terms'][q_t]
 
             for j in range(len(prf_docs_terms_info['id'])):
                 doc_id = prf_docs_terms_info['id'][j]
-                doc_terms_vec = np.array(prf_docs_terms_info['embedding'][j])
+                doc_terms_embeds = prf_docs_terms_info['embedding'][j]
 
-                for d_t in range(len(doc_terms_vec)):
+                for d_t in range(len(doc_terms_embeds)):
                     term = prf_docs_terms_info['terms'][j][d_t]
-                    doc_term_vec = doc_terms_vec[d_t]
-                    sim = 1 - spatial.distance.cosine(term_vec, doc_term_vec)
-                    similarity_q.setdefault(q_t_mention, {})
-                    similarity_q[q_t_mention].setdefault(doc_id, []).append((term, sim))
+                    doc_term_vec = np.array(doc_terms_embeds[d_t])
+
+                    if doc_term_vec.ndim > 1:
+                        doc_term_vec = doc_term_vec.flatten()
+
+                    # Check dimension compatibility
+                    if len(term_vec) == len(doc_term_vec):
+                        try:
+                            sim = 1 - spatial.distance.cosine(term_vec, doc_term_vec)
+                            similarity_q.setdefault(q_t_mention, {})
+                            similarity_q[q_t_mention].setdefault(doc_id, []).append((term, sim))
+                        except Exception as e:
+                            logger.debug(f"Similarity calculation error: {e}")
+                            similarity_q.setdefault(q_t_mention, {})
+                            similarity_q[q_t_mention].setdefault(doc_id, []).append((term, 0.0))
 
         return similarity_q
 
@@ -382,6 +594,9 @@ class CEQEModel:
         for doc_id in retrieval_result_query:
             doc_scores.append(retrieval_result_query[doc_id])
 
+        if not doc_scores:
+            return {}
+
         log_sum_exp = logsumexp(doc_scores)
         posteriors = {}
         for doc_id in retrieval_result_query:
@@ -404,24 +619,30 @@ class CEQEModel:
         """Following original queryTerm_vs_per_doc_context_rm.py"""
         import sys
 
+        if not similarity_queryTerms_to_docs_terms:
+            return {}
+
         def get_terms(doc_id):
             terms = set()
             sample_query_term = list(similarity_queryTerms_to_docs_terms.keys())[0]
-            for mention in similarity_queryTerms_to_docs_terms[sample_query_term][doc_id]:
-                terms.add(mention[0])
+            if doc_id in similarity_queryTerms_to_docs_terms[sample_query_term]:
+                for mention in similarity_queryTerms_to_docs_terms[sample_query_term][doc_id]:
+                    terms.add(mention[0])
             return list(terms)
 
         def get_normalizer(q_t, doc_id):
             normalizer = 0
-            for m in similarity_queryTerms_to_docs_terms[q_t][doc_id]:
-                normalizer += m[1]
+            if q_t in similarity_queryTerms_to_docs_terms and doc_id in similarity_queryTerms_to_docs_terms[q_t]:
+                for m in similarity_queryTerms_to_docs_terms[q_t][doc_id]:
+                    normalizer += m[1]
             return normalizer
 
         def get_sum_sim_score_termMentions_to_queryTerm(q_t, doc_id, term):
             sum_sim_score = 0
-            for mention in similarity_queryTerms_to_docs_terms[q_t][doc_id]:
-                if mention[0] == term:
-                    sum_sim_score += mention[1]
+            if q_t in similarity_queryTerms_to_docs_terms and doc_id in similarity_queryTerms_to_docs_terms[q_t]:
+                for mention in similarity_queryTerms_to_docs_terms[q_t][doc_id]:
+                    if mention[0] == term:
+                        sum_sim_score += mention[1]
             return sum_sim_score
 
         docs_terms_scores = {}
@@ -461,6 +682,9 @@ class CEQEModel:
         for doc_id in retrieval_result_query:
             doc_scores.append(retrieval_result_query[doc_id])
 
+        if not doc_scores:
+            return {}
+
         log_sum_exp = logsumexp(doc_scores)
         posteriors = {}
         for doc_id in retrieval_result_query:
@@ -499,7 +723,7 @@ class CEQEModel:
 
 
 class IRDatasetHandler:
-    """Handles ir_datasets integration for any dataset (reused from ANCE-PRF)."""
+    """Handles ir_datasets integration for any dataset (reused from ANCE-PRF) - FIXED VERSION."""
 
     def __init__(self, dataset_name: str, cache_dir: Optional[str] = None, lazy_loading: bool = False):
         self.dataset_name = dataset_name
@@ -610,7 +834,7 @@ class IRDatasetHandler:
                 logger.warning(f"Failed to save query cache: {e}")
 
     def _extract_document_text(self, doc) -> str:
-        """Extract text from document with flexible field handling."""
+        """Extract and clean document text with robust handling - FIXED VERSION."""
         text_parts = []
 
         # Common document fields to check (in order of preference)
@@ -633,7 +857,17 @@ class IRDatasetHandler:
                     except:
                         continue
 
-        return " ".join(text_parts) if text_parts else ""
+        combined_text = " ".join(text_parts) if text_parts else ""
+
+        # Aggressive truncation for very long documents
+        max_length = 50000
+        if len(combined_text) > max_length:
+            logger.warning(
+                f"Truncating doc {getattr(doc, 'doc_id', 'unknown')} from {len(combined_text)} to {max_length} chars.")
+            combined_text = combined_text[:max_length]
+
+        # Clean the text
+        return clean_text(combined_text)
 
     def _extract_query_text(self, query) -> str:
         """Extract text from query with flexible field handling."""
@@ -644,7 +878,7 @@ class IRDatasetHandler:
             if hasattr(query, field):
                 field_value = getattr(query, field)
                 if field_value and str(field_value).strip():
-                    return str(field_value).strip()
+                    return clean_text(str(field_value).strip())
 
         # If no standard fields found, try to get any string attributes
         for attr_name in dir(query):
@@ -652,7 +886,7 @@ class IRDatasetHandler:
                 try:
                     attr_value = getattr(query, attr_name)
                     if isinstance(attr_value, str) and attr_value.strip():
-                        return attr_value.strip()
+                        return clean_text(attr_value.strip())
                 except:
                     continue
 
@@ -695,7 +929,7 @@ class IRDatasetHandler:
         return None
 
     def get_documents_text(self, doc_ids: List[str]) -> List[str]:
-        """Get multiple document texts with batch lazy loading."""
+        """Get multiple document texts with batch lazy loading - IMPROVED VERSION."""
         doc_texts = []
         missing_ids = []
 
@@ -749,7 +983,7 @@ class IRDatasetHandler:
 
 
 class CEQEReranker:
-    """Main CEQE reranking system that combines all components."""
+    """Main CEQE reranking system that combines all components - FIXED VERSION."""
 
     def __init__(self,
                  dataset_name: str,
@@ -780,62 +1014,86 @@ class CEQEReranker:
     def expand_query_with_ceqe(self, query_text: str, prf_doc_texts: List[str], prf_doc_ids: List[str],
                                retrieval_scores: Dict[str, float], method: str = 'centroid') -> List[Tuple[str, float]]:
         """
-        Perform CEQE expansion for a single query.
-
-        Args:
-            query_text: Original query text
-            prf_doc_texts: PRF document texts
-            prf_doc_ids: PRF document IDs
-            retrieval_scores: Original retrieval scores for PRF docs
-            method: CEQE method ('centroid', 'term_max', 'term_mul')
-
-        Returns:
-            List of (term, score) expansion terms
+        FIXED version of CEQE expansion that handles shape mismatches.
         """
         if not prf_doc_texts:
             return []
 
         try:
+            # Clean query text
+            query_text = clean_text(query_text)
+            if not query_text:
+                logger.warning("Empty query text after cleaning")
+                return []
+
             # Process query
             query_features = [self.model.doc_processor.convert_example_to_feature(query_text, 'query', chunk=False)]
 
-            # Process documents
+            # Process documents with better error handling
             doc_features = []
+            valid_doc_indices = []
+
             for i, doc_text in enumerate(prf_doc_texts):
+                if not doc_text or not doc_text.strip():
+                    continue
+
                 doc_id = prf_doc_ids[i]
-                features = self.model.doc_processor.convert_example_to_feature(doc_text, doc_id, chunk=True)
-                if isinstance(features, list):
-                    doc_features.extend(features)
-                else:
-                    doc_features.append(features)
+                try:
+                    features = self.model.doc_processor.convert_example_to_feature(doc_text, doc_id, chunk=True)
+                    if isinstance(features, list):
+                        for feat in features:
+                            doc_features.append(feat)
+                            valid_doc_indices.append(i)
+                    else:
+                        doc_features.append(features)
+                        valid_doc_indices.append(i)
+                except Exception as e:
+                    logger.warning(f"Error processing document {doc_id}: {e}")
+                    continue
 
-            # Get embeddings
-            batch_size = 32
+            if not doc_features:
+                logger.warning("No valid document features generated")
+                return []
 
-            # Query embeddings - both pooled and token-level
-            query_embedding_pooled = self.model.get_embedding_matrix(query_features, PoolingStrategy.REDUCE_MEAN)
-            query_embedding_tokens = self.model.get_embedding_matrix(query_features, PoolingStrategy.NONE)
+            # Get embeddings with batch processing
+            batch_size = 8  # Smaller batch size to avoid memory issues
 
-            query_embedding_pooled = query_embedding_pooled.detach().cpu().numpy()
-            query_embedding_tokens = query_embedding_tokens.detach().cpu().numpy()
+            # Query embeddings
+            try:
+                query_embedding_pooled = self.model.get_embedding_matrix(query_features, PoolingStrategy.REDUCE_MEAN)
+                query_embedding_tokens = self.model.get_embedding_matrix(query_features, PoolingStrategy.NONE)
 
-            # Remove zero tokens for token-level query
+                query_embedding_pooled = query_embedding_pooled.detach().cpu().numpy()
+                query_embedding_tokens = query_embedding_tokens.detach().cpu().numpy()
+            except Exception as e:
+                logger.warning(f"Error in query embedding: {e}")
+                return []
+
+            # Remove zero tokens for query
             query_embedding_tokens_clean = self.model.remove_zero_tokens(query_embedding_tokens)
 
-            # Doc embeddings
-            doc_embeddings = []
+            # Doc embeddings with batching
+            doc_embeddings_list = []
             for i in range(0, len(doc_features), batch_size):
                 batch = doc_features[i:i + batch_size]
-                batch_embeddings = self.model.get_embedding_matrix(batch, PoolingStrategy.NONE)
-                doc_embeddings.append(batch_embeddings.detach().cpu().numpy())
+                try:
+                    batch_embeddings = self.model.get_embedding_matrix(batch, PoolingStrategy.NONE)
+                    doc_embeddings_list.append(batch_embeddings.detach().cpu().numpy())
+                except Exception as e:
+                    logger.warning(f"Error processing batch {i // batch_size}: {e}")
+                    continue
 
-            doc_embeddings = np.concatenate(doc_embeddings, axis=0)
+            if not doc_embeddings_list:
+                logger.warning("No valid document embeddings generated")
+                return []
+
+            doc_embeddings = np.concatenate(doc_embeddings_list, axis=0)
             doc_embeddings_clean = self.model.remove_zero_tokens(doc_embeddings)
 
-            # Convert to info structures
+            # Create info structures with better shape handling
             query_info_pooled = {
                 'id': 'query',
-                'embedding': query_embedding_pooled[0]
+                'embedding': query_embedding_pooled[0]  # Single query embedding
             }
 
             query_info_tokens = {
@@ -850,9 +1108,13 @@ class CEQEReranker:
                 'embedding': doc_embeddings_clean
             }
 
-            # Group tokens to terms for documents
-            docs_terms, docs_terms_embeds = self.model.get_terms(docs_info)
-            docs_terms_embeds_pooled = self.model.get_terms_embeds_pooled(docs_terms, docs_terms_embeds)
+            # Process terms with error handling
+            try:
+                docs_terms, docs_terms_embeds = self.model.get_terms(docs_info)
+                docs_terms_embeds_pooled = self.model.get_terms_embeds_pooled(docs_terms, docs_terms_embeds)
+            except Exception as e:
+                logger.warning(f"Error in term processing: {e}")
+                return []
 
             # Create PRF docs terms info
             prf_docs_terms_info = {
@@ -861,36 +1123,47 @@ class CEQEReranker:
                 'embedding': docs_terms_embeds_pooled
             }
 
-            if method == 'centroid':
-                # Centroid approach
-                similarity = self.model.get_similarity_query_and_docTerms_CAR(query_info_pooled, prf_docs_terms_info)
-                exp_terms_score = self.model.query_vs_per_doc_context_rm(similarity, retrieval_scores)
+            # Apply CEQE method with error handling
+            try:
+                if method == 'centroid':
+                    similarity = self.model.get_similarity_query_and_docTerms_CAR(query_info_pooled,
+                                                                                  prf_docs_terms_info)
+                    exp_terms_score = self.model.query_vs_per_doc_context_rm(similarity, retrieval_scores)
+                else:
+                    # Term-based methods
+                    query_terms, query_terms_embeds = self.model.get_terms(query_info_tokens)
+                    query_terms_embeds_pooled = self.model.get_terms_embeds_pooled(query_terms, query_terms_embeds)
 
-            else:
-                # Term-based approach
-                query_terms, query_terms_embeds = self.model.get_terms(query_info_tokens)
-                query_terms_embeds_pooled = self.model.get_terms_embeds_pooled(query_terms, query_terms_embeds)
+                    query_info_terms = {
+                        'id': 'query',
+                        'terms': query_terms[0] if query_terms else [],
+                        'embedding': query_terms_embeds_pooled[0] if query_terms_embeds_pooled else []
+                    }
 
-                query_info_terms = {
-                    'id': 'query',
-                    'terms': query_terms[0],
-                    'embedding': query_terms_embeds_pooled[0]
-                }
+                    similarity = self.model.get_similarity_queryTerms_and_docsTerms_CAR(query_info_terms,
+                                                                                        prf_docs_terms_info)
+                    pooling_method = 'max' if method == 'term_max' else 'mul'
+                    exp_terms_score = self.model.queryTerm_vs_per_doc_context_rm(similarity, retrieval_scores,
+                                                                                 pooling_method)
 
-                similarity = self.model.get_similarity_queryTerms_and_docsTerms_CAR(query_info_terms,
-                                                                                    prf_docs_terms_info)
-                pooling_method = 'max' if method == 'term_max' else 'mul'
-                exp_terms_score = self.model.queryTerm_vs_per_doc_context_rm(similarity, retrieval_scores,
-                                                                             pooling_method)
+                # Get expansion terms
+                expansion_terms = self.model.get_unique_expansion_terms(exp_terms_score, query_text,
+                                                                        self.num_expansion_terms)
 
-            # Get expansion terms
-            expansion_terms = self.model.get_unique_expansion_terms(exp_terms_score, query_text,
-                                                                    self.num_expansion_terms)
+                # Clean up memory
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-            return expansion_terms
+                return expansion_terms
+
+            except Exception as e:
+                logger.warning(f"Error in similarity calculation: {e}")
+                return []
 
         except Exception as e:
             logger.warning(f"Error in CEQE expansion: {e}")
+            import traceback
+            traceback.print_exc()
             return []
 
     def rerank_run(self,
@@ -899,7 +1172,7 @@ class CEQEReranker:
                    method: str = 'centroid',
                    rerank_depth: int = 100,
                    expansion_weight: float = 0.1) -> None:
-        """Rerank a TREC run file using CEQE and save results."""
+        """Rerank a TREC run file using CEQE and save results - IMPROVED VERSION."""
 
         # Load run file
         run_loader = TRECRunLoader(run_path)
@@ -916,20 +1189,28 @@ class CEQEReranker:
 
         logger.info(f"Found {len(all_doc_ids)} unique documents to process")
 
-        # Pre-load all documents
+        # Pre-load and clean all documents
         all_doc_ids_list = list(all_doc_ids)
         all_doc_texts = self.dataset_handler.get_documents_text(all_doc_ids_list)
 
-        # Create mapping from doc_id to text
-        doc_id_to_text = {}
-        for doc_id, doc_text in zip(all_doc_ids_list, all_doc_texts):
-            if doc_text.strip():
-                doc_id_to_text[doc_id] = doc_text
+        # Preprocess all documents
+        cleaned_doc_texts = preprocess_document_batch(all_doc_texts, max_doc_length=5000)
 
-        logger.info(f"Loaded {len(doc_id_to_text)} valid documents")
+        # Create mapping from doc_id to text, filtering out empty/problematic docs
+        doc_id_to_text = {}
+        empty_docs = 0
+
+        for doc_id, doc_text in zip(all_doc_ids_list, cleaned_doc_texts):
+            if doc_text and doc_text.strip():
+                doc_id_to_text[doc_id] = doc_text
+            else:
+                empty_docs += 1
+
+        logger.info(f"Loaded {len(doc_id_to_text)} valid documents, skipped {empty_docs} empty/problematic docs")
 
         # Process each query
         reranked_results = {}
+        successful_queries = 0
 
         for qid in tqdm(run_loader.run_data.keys(), desc="Processing queries"):
             query_text = self.dataset_handler.get_query_text(qid)
@@ -948,6 +1229,8 @@ class CEQEReranker:
 
             if not valid_docs:
                 logger.warning(f"No valid documents found for query {qid}")
+                # Store original order for queries with no valid docs
+                reranked_results[qid] = [(doc_id, score) for doc_id, score in query_docs]
                 continue
 
             # Get PRF documents and their texts
@@ -962,29 +1245,34 @@ class CEQEReranker:
             )
 
             # Rerank documents based on expansion terms
-            expansion_words = set([term for term, _ in expansion_terms])
-
-            reranked_docs = []
-            for doc_id, orig_score in valid_docs:
-                doc_text = doc_id_to_text[doc_id].lower()
-
-                # Count expansion term matches
-                term_matches = sum(1 for term in expansion_words if term.lower() in doc_text)
-
-                # Boost score based on expansion term matches
-                boost = expansion_weight * term_matches / max(1, len(expansion_words))
-                new_score = orig_score + boost
-
-                reranked_docs.append((doc_id, new_score))
-
-            # Sort by new scores
-            reranked_docs.sort(key=lambda x: x[1], reverse=True)
-
-            # Store results
-            reranked_results[qid] = reranked_docs
-
             if expansion_terms:
-                logger.debug(f"Query {qid}: {len(expansion_terms)} expansion terms")
+                expansion_words = set([term.lower() for term, _ in expansion_terms])
+                successful_queries += 1
+
+                reranked_docs = []
+                for doc_id, orig_score in valid_docs:
+                    doc_text = doc_id_to_text[doc_id].lower()
+
+                    # Count expansion term matches
+                    term_matches = sum(1 for term in expansion_words if term in doc_text)
+
+                    # Boost score based on expansion term matches
+                    boost = expansion_weight * term_matches / max(1, len(expansion_words))
+                    new_score = orig_score + boost
+
+                    reranked_docs.append((doc_id, new_score))
+
+                # Sort by new scores
+                reranked_docs.sort(key=lambda x: x[1], reverse=True)
+                reranked_results[qid] = reranked_docs
+
+                logger.debug(f"Query {qid}: {len(expansion_terms)} expansion terms, boosted {term_matches} docs")
+            else:
+                # No expansion terms found, keep original order
+                reranked_results[qid] = valid_docs
+                logger.debug(f"Query {qid}: No expansion terms found, keeping original order")
+
+        logger.info(f"Successfully expanded {successful_queries}/{len(run_loader.run_data)} queries")
 
         # Save reranked results
         self._save_results(reranked_results, output_path)
@@ -999,7 +1287,7 @@ class CEQEReranker:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CEQE Reranking System")
+    parser = argparse.ArgumentParser(description="CEQE Reranking System - Fixed Version")
     parser.add_argument("--dataset", required=True, help="IR dataset name (e.g., 'msmarco-passage/dev')")
     parser.add_argument("--run", required=True, help="Path to TREC run file")
     parser.add_argument("--output", required=True, help="Path to output reranked file")
@@ -1015,8 +1303,12 @@ def main():
     parser.add_argument("--cache-dir", help="Directory to cache dataset files")
     parser.add_argument("--lazy-loading", action="store_true", help="Enable lazy loading for large datasets")
     parser.add_argument("--list-datasets", action="store_true", help="List available ir_datasets and exit")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
     args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     if args.list_datasets:
         print("Popular ir_datasets datasets:")
@@ -1040,28 +1332,37 @@ def main():
         logger.warning("Some functionality may be limited, but basic operation should work")
 
     # Initialize reranker
-    reranker = CEQEReranker(
-        dataset_name=args.dataset,
-        model_name=args.model_name,
-        max_seq_len=args.max_seq_len,
-        device=args.device,
-        num_feedback_docs=args.num_feedback,
-        num_expansion_terms=args.num_expansion_terms,
-        cache_dir=args.cache_dir,
-        lazy_loading=args.lazy_loading
-    )
+    try:
+        reranker = CEQEReranker(
+            dataset_name=args.dataset,
+            model_name=args.model_name,
+            max_seq_len=args.max_seq_len,
+            device=args.device,
+            num_feedback_docs=args.num_feedback,
+            num_expansion_terms=args.num_expansion_terms,
+            cache_dir=args.cache_dir,
+            lazy_loading=args.lazy_loading
+        )
 
-    # Perform reranking
-    reranker.rerank_run(
-        run_path=args.run,
-        output_path=args.output,
-        method=args.method,
-        rerank_depth=args.rerank_depth,
-        expansion_weight=args.expansion_weight
-    )
+        # Perform reranking
+        reranker.rerank_run(
+            run_path=args.run,
+            output_path=args.output,
+            method=args.method,
+            rerank_depth=args.rerank_depth,
+            expansion_weight=args.expansion_weight
+        )
 
-    print(f"CEQE reranking completed. Results saved to {args.output}")
+        print(f"CEQE reranking completed successfully. Results saved to {args.output}")
+
+    except Exception as e:
+        logger.error(f"CEQE reranking failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
