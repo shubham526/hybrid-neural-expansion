@@ -91,6 +91,14 @@ def main():
                         help="Path to save TREC run file (e.g., runs/bm25_colbert_prf.txt)")
     parser.add_argument("--top-k", type=int, default=1000,
                         help="Number of BM25 documents to retrieve (default: 1000)")
+    parser.add_argument("--fb-docs", type=int, default=3,
+                        help="Number of feedback documents for PRF (default: 3)")
+    parser.add_argument("--fb-embs", type=int, default=10,
+                        help="Number of expansion embeddings for PRF (default: 10)")
+    parser.add_argument("--beta", type=float, default=1.0,
+                        help="Weight of expansion embeddings (default: 1.0)")
+    parser.add_argument("--k-clusters", type=int, default=24,
+                        help="Number of clusters for PRF (default: 24)")
 
     args = parser.parse_args()
 
@@ -101,14 +109,12 @@ def main():
         pt.init()
     print("--- PyTerrier Initialized ---")
 
-    import pyterrier_colbert
-    from pyterrier_colbert.ranking import ColBERTFactory, ColBERTPRF
+    from pyt_colbert import ColBERTFactory, ColbertPRF
 
     print("Step 2: Loading dataset topics...")
     dataset = pt.get_dataset("irds:disks45/nocr/trec-robust-2004")
     topics = dataset.get_topics()
     topics = topics.rename(columns={"title": "query"})
-    # you can add your preprocess_queries(topics) call here if you wish
     topics = preprocess_queries(topics)
     print(f"--- Loaded {len(topics)} topics ---")
 
@@ -133,20 +139,38 @@ def main():
         index_name=args.colbert_index_name,
         faiss_partitions=100
     )
-    colbert_prf_reranker = colbert_factory.prf(rerank=True)
     print("--- ColBERTFactory Initialized ---")
 
-    print("Step 6: Building the final pipeline...")
-    pipeline = bm25 >> colbert_prf_reranker
+    print("Step 6: Building ColBERT PRF reranker...")
+    colbert_prf_transformer = ColbertPRF(
+        colbert_factory,
+        k=args.k_clusters,
+        fb_docs=args.fb_docs,
+        fb_embs=args.fb_embs,
+        beta=args.beta,
+        return_docs=True
+    )
+    print("--- ColBERT PRF transformer built ---")
+
+    print("Step 7: Building the final pipeline...")
+    pipeline = (
+        bm25 >>
+        colbert_factory.query_encoder() >>
+        colbert_factory.index_scorer(query_encoded=True, add_ranks=True) >>
+        colbert_prf_transformer >>
+        colbert_factory.index_scorer(query_encoded=True, add_ranks=True) % 1000
+    )
     print("--- Pipeline built ---")
 
-    print("Step 7: Starting pipeline.transform() on all topics...")
+    print("Step 8: Starting pipeline.transform() on all topics...")
     results = pipeline.transform(topics)
 
-    print("Step 8: Saving TREC run file...")
+    print("Step 9: Saving TREC run file...")
     pt.io.write_run(results, args.output, format="trec")
 
     print("✅ Retrieval and reranking completed successfully.")
+    print(f"Results saved to: {args.output}")
+    print(f"Total results: {len(results)}")
 
 if __name__ == "__main__":
     main()
