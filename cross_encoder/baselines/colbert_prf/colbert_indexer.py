@@ -61,33 +61,12 @@ def create_colbert_index(dataset_name: str,
         """Document generator with a workaround to skip a problematic data range."""
         logger.info("Generating documents for ColBERT indexing...")
 
-        # --- WORKAROUND CONFIGURATION ---
-        # Define the range of document indices to skip.
-        # We'll skip a small buffer around the known hang point.
-        SKIP_START_INDEX = 46400
-        SKIP_END_INDEX = 46600  # Skips 200 documents in the problematic region
-        logger.warning(f"WORKAROUND ENABLED: Skipping documents from index {SKIP_START_INDEX} to {SKIP_END_INDEX}")
-        # ---
-
         doc_count = 0
         skipped_count = 0
 
         # We now need the index, so we use enumerate
         for i, doc in enumerate(
                 tqdm(dataset.docs_iter(), desc="Processing documents", total=dataset.docs_count(), unit="docs")):
-
-            # Check if the current document index is within the skip zone
-            if SKIP_START_INDEX <= i < SKIP_END_INDEX:
-                skipped_count += 1
-                if i == SKIP_START_INDEX:
-                    logger.info("Entering skip zone...")
-                continue
-
-            # Log once when we exit the skip zone
-            if i == SKIP_END_INDEX:
-                logger.info(
-                    f"...Exited skip zone after skipping {skipped_count} documents. Resuming normal processing.")
-
             try:
                 doc_id = getattr(doc, 'doc_id', None)
                 if not doc_id:
