@@ -100,7 +100,7 @@ class re_ranker_mmap:
         _, all_parts_paths, _ = get_parts(index_path)
         
         if memtype == "mmap":
-            all_parts_paths = [ file.replace(".pt", ".store") for file in all_parts_paths ]
+            # all_parts_paths = [ file.replace(".pt", ".store") for file in all_parts_paths ]
             mmaps = [file_part_mmap(path, doclens, dim) for path, doclens in zip(all_parts_paths, part_doclens)]
         elif memtype == "mem":
             mmaps = [file_part_mem(path, doclens, dim) for path, doclens in tqdm(zip(all_parts_paths, part_doclens), total=len(all_parts_paths), desc="Loading index shards to memory", unit="shard")]
@@ -498,6 +498,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             faiss_partitions=None,#TODO 100-
             memtype = "mem",
             faisstype= "mem",
+            faiss_on_gpu=True,
             **kwargs):
         
         super().__init__(colbert_model, **kwargs)
@@ -522,7 +523,7 @@ class ColBERTFactory(ColBERTModelOnlyFactory):
             else:
                 self.docid_as_docno = True
         
-        self.faiss_index_on_gpu = True
+        self.faiss_index_on_gpu = faiss_on_gpu
         if not self.gpu:
             self.faiss_index_on_gpu = False
 

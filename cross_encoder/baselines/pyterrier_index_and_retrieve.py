@@ -551,7 +551,14 @@ class PyTerrierProcessor:
                 print(f"Using {len(queries)} queries from TSV file: {queries_file}")
             else:
                 print("Loading dataset queries...")
-                queries = self.dataset.get_topics()
+                # Convert ir_datasets queries to DataFrame
+                queries_list = []
+                for query in self.dataset.queries_iter():
+                    queries_list.append({
+                        'qid': query.query_id,
+                        'query': query.text
+                    })
+                queries = pd.DataFrame(queries_list)
                 print(f"Loaded {len(queries)} queries from dataset")
 
                 # Handle multiple query fields in dataset

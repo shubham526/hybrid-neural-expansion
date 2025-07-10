@@ -11,10 +11,15 @@ import logging
 from pathlib import Path
 import re
 import unicodedata
+import sys
 
 import pyterrier as pt
 import ir_datasets
 from tqdm import tqdm
+
+# This assumes your script is 4 levels deep from the root as shown in the screenshot
+project_root = Path(__file__).resolve().parent.parent.parent.parent
+sys.path.insert(0, str(project_root))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

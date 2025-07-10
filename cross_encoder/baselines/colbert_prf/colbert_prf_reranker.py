@@ -468,7 +468,9 @@ def main():
                 index_root=args.colbert_index_root,
                 index_name=args.colbert_index_name,
                 faiss_partitions=100,
-                gpu=args.gpu  # Use GPU setting from args
+                gpu=args.gpu,
+                faisstype="mmap",
+                memtype="mmap"
             )
             logger.info("--- ColBERTFactory Initialized ---")
         except Exception as e:
