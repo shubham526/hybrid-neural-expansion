@@ -525,7 +525,7 @@ class PyTerrierProcessor:
             return None
 
     def retrieve_queries(self, output_file, run_name="BM25_run", custom_queries=None, queries_file=None,
-                         query_field="title"):
+                         query_field="auto"):
         """
         Perform retrieval on dataset queries with progress tracking
 
@@ -550,52 +550,59 @@ class PyTerrierProcessor:
                 queries = load_queries_from_tsv(queries_file)
                 print(f"Using {len(queries)} queries from TSV file: {queries_file}")
             else:
+                # ==================================================================
+                # START: IMPROVED LOGIC FOR LOADING DATASET QUERIES
+                # ==================================================================
                 print("Loading dataset queries...")
-                # Convert ir_datasets queries to DataFrame
                 queries_list = []
+                # 1. Load all relevant fields from the ir_datasets query objects
                 for query in self.dataset.queries_iter():
+                    # Use getattr to safely access attributes that might not exist in all datasets
                     queries_list.append({
-                        'qid': query.query_id,
-                        'query': query.text
+                        'qid': getattr(query, 'query_id', None),
+                        'title': getattr(query, 'title', ''),
+                        'description': getattr(query, 'description', ''),
+                        'narrative': getattr(query, 'narrative', ''),
+                        'text': getattr(query, 'text', '')  # Keep for datasets that use .text
                     })
                 queries = pd.DataFrame(queries_list)
-                print(f"Loaded {len(queries)} queries from dataset")
+                print(f"Loaded {len(queries)} potential query fields from dataset")
 
-                # Handle multiple query fields in dataset
-                if 'query' not in queries.columns:
-                    available_fields = [col for col in queries.columns if
-                                        col in ['title', 'description', 'narrative', 'text']]
-                    print(f"Available query fields: {available_fields}")
+                # 2. Now, select the correct field to use as the 'query'
+                available_fields = [col for col in ['title', 'description', 'narrative', 'text'] if
+                                    col in queries.columns and queries[col].str.strip().any()]
+                print(f"Available query fields with content: {available_fields}")
 
-                    if query_field == "auto":
-                        # Auto-select the best field
-                        if 'title' in available_fields:
-                            query_field = 'title'
-                        elif 'description' in available_fields:
-                            query_field = 'description'
-                        elif 'text' in available_fields:
-                            query_field = 'text'
-                        else:
-                            query_field = available_fields[0]
+                selected_field = query_field
+                if selected_field == "auto":
+                    if 'title' in available_fields:
+                        selected_field = 'title'
+                    elif 'text' in available_fields:
+                        selected_field = 'text'
+                    elif 'description' in available_fields:
+                        selected_field = 'description'
+                    else:
+                        selected_field = available_fields[0]
 
-                    if query_field not in available_fields:
-                        print(f"Error: Requested query field '{query_field}' not available.")
-                        print(f"Available fields: {available_fields}")
-                        return None
+                if selected_field not in available_fields:
+                    print(f"Error: Requested query field '{selected_field}' not available or has no content.")
+                    print(f"Available fields: {available_fields}")
+                    return None
 
-                    print(f"Using query field: '{query_field}'")
+                print(f"Using '{selected_field}' as the query field.")
 
-                    # Create a copy with standardized 'query' column
-                    queries = queries.copy()
-                    queries['query'] = queries[query_field]
+                # 3. Create the final 'query' column
+                queries['query'] = queries[selected_field]
 
-                    # Ensure we have a 'qid' column
-                    if 'qid' not in queries.columns:
-                        if 'query_id' in queries.columns:
-                            queries['qid'] = queries['query_id']
-                        else:
-                            queries = queries.reset_index()
-                            queries['qid'] = queries.index.astype(str)
+                # Ensure we have a valid qid column
+                if 'qid' not in queries.columns or queries['qid'].isnull().any():
+                    queries['qid'] = queries.index.astype(str)
+
+                # Select only the essential columns for the rest of the pipeline
+                queries = queries[['qid', 'query']]
+                # ==================================================================
+                # END: IMPROVED LOGIC
+                # ==================================================================
 
             if queries_file is None:  # Only preprocess if not already done by load_queries_from_tsv
                 queries = preprocess_queries(queries)
@@ -652,7 +659,7 @@ class PyTerrierProcessor:
             print(f"\nRetrieval completed in {end_time - start_time:.2f} seconds")
 
             # Display results summary
-            if len(results) > 0:
+            if not results.empty:
                 print(f"\nResults summary:")
                 print(f"  Total query-document pairs: {len(results):,}")
                 print(f"  Unique queries: {results['qid'].nunique()}")
@@ -677,6 +684,8 @@ class PyTerrierProcessor:
 
         except Exception as e:
             print(f"Error during retrieval: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def search_single_query(self, query_text, num_results=10, qe_method="none", qe_params=None):
