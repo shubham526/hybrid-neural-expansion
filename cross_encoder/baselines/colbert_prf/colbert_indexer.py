@@ -25,11 +25,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def create_colbert_index(dataset_name: str,
-                         checkpoint_path: str,
-                         index_root: str,
-                         index_name: str,
-                         chunksize: float = 6.0):
+def create_colbert_index(
+        dataset_name: str,
+        checkpoint_path: str,
+        index_root: str,
+        index_name: str,
+        chunksize: float = 6.0,
+        ids: bool = False,
+        nbits: int = None,
+        fp16: bool = False,
+):
     """
     Create ColBERT index from ir_datasets collection.
 
@@ -115,9 +120,9 @@ def create_colbert_index(dataset_name: str,
             index_root=index_root,
             index_name=index_name,
             chunksize=chunksize,
-            ids=True,
-            nbits=2,
-            fp16=True
+            ids=ids,
+            nbits=nbits,
+            fp16=fp16
 
         )
 
@@ -225,6 +230,12 @@ def main():
 
     parser.add_argument("--dataset", required=True,
                         help="ir_datasets name (e.g., 'disks45/nocr/trec-robust-2004')")
+    parser.add_argument("--store-ids", action="store_true",
+                        help="Do you want to store doc_ids in the index? (default: False)")
+    parser.add_argument('--nbits', type=int, default=None,
+                        help="Number of bits for quantization (e.g., 2 or 4). No quantization if not set.")
+    parser.add_argument('--fp16', action="store_true",
+                        help="Enable half-precision (fp16) indexing.")
     parser.add_argument("--checkpoint", required=True,
                         help="Path to ColBERT checkpoint")
     parser.add_argument("--index-root", required=True,
@@ -247,7 +258,10 @@ def main():
         checkpoint_path=args.checkpoint,
         index_root=args.index_root,
         index_name=args.index_name,
-        chunksize=args.chunksize
+        chunksize=args.chunksize,
+        ids=args.store_ids,
+        nbits=args.nbits,
+        fp16=args.fp16,
     )
 
     print(f"✅ ColBERT index '{args.index_name}' created successfully!")

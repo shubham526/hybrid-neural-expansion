@@ -415,6 +415,14 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="Test pipeline on first 5 queries only")
     parser.add_argument('--log-level', type=str, default='INFO')
+    parser.add_argument('--memtype', type=str, default='mem', choices=['mem', 'mmap'],
+                        help="Memory type for loading raw embeddings: 'mem' or 'mmap'.")
+
+    parser.add_argument('--faisstype', type=str, default='mem', choices=['mem', 'mmap'],
+                        help="Memory type for loading Faiss index: 'mem' or 'mmap'.")
+
+    parser.add_argument('--faiss-on-cpu', action='store_false', dest='faiss_on_gpu',
+                        help="Force Faiss index to be loaded on CPU to save VRAM.")
 
 
     args = parser.parse_args()
@@ -469,8 +477,9 @@ def main():
                 index_name=args.colbert_index_name,
                 faiss_partitions=100,
                 gpu=args.gpu,
-                faisstype="mmap",
-                memtype="mmap"
+                faisstype=args.faisstype,
+                memtype=args.memtype,
+                faiss_on_gpu=args.faiss_on_gpu
             )
             logger.info("--- ColBERTFactory Initialized ---")
         except Exception as e:
