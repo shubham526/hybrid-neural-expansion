@@ -36,6 +36,134 @@ except ImportError as e:
     sys.exit(1)
 
 
+def get_query_column_name(topics_df):
+    """
+    Intelligently detect the appropriate query column name from the topics DataFrame.
+
+    Args:
+        topics_df: DataFrame containing topic/query data
+
+    Returns:
+        str: The column name to use for queries
+
+    Raises:
+        ValueError: If no suitable query column is found
+    """
+    # Priority order for query fields
+    query_field_priority = [
+        'query',  # Already standardized
+        'text',  # MS MARCO, some BEIR datasets
+        'title',  # TREC Robust, many TREC collections
+        'question',  # Natural Questions, some QA datasets
+        'body',  # Some datasets use 'body'
+        'description'  # Some datasets have description as main query
+    ]
+
+    available_columns = set(topics_df.columns)
+    logger.info(f"Available topic columns: {sorted(available_columns)}")
+
+    # Check each field in priority order
+    for field in query_field_priority:
+        if field in available_columns:
+            logger.info(f"Using '{field}' as query field")
+            return field
+
+    # If no standard field found, look for any column containing 'query' or 'text'
+    for col in available_columns:
+        if 'query' in col.lower() or 'text' in col.lower():
+            logger.info(f"Using '{col}' as query field (contains 'query' or 'text')")
+            return col
+
+    # Last resort: use the first string column that's not 'qid' or 'docno'
+    for col in topics_df.columns:
+        if col not in ['qid', 'docno', 'query_id', 'topic_id'] and topics_df[col].dtype == 'object':
+            logger.info(f"Using '{col}' as query field (first string column)")
+            return col
+
+    raise ValueError(f"Could not identify query column in: {list(available_columns)}")
+
+
+def get_query_text(query_obj):
+    """
+    Extract query text from ir_datasets query object.
+
+    Args:
+        query_obj: Query object from ir_datasets
+
+    Returns:
+        str: The query text
+    """
+    if hasattr(query_obj, 'text'):
+        return query_obj.text
+    elif hasattr(query_obj, 'title'):
+        # For TREC topics, optionally combine title and description
+        if hasattr(query_obj, 'description') and query_obj.description and query_obj.description.strip():
+            return f"{query_obj.title} {query_obj.description}"
+        return query_obj.title
+    elif hasattr(query_obj, 'question'):
+        return query_obj.question
+    elif hasattr(query_obj, 'body'):
+        return query_obj.body
+    elif hasattr(query_obj, 'description'):
+        return query_obj.description
+    else:
+        # Convert to string as fallback
+        return str(query_obj)
+
+
+def load_and_standardize_topics(dataset_name, use_title_desc=False):
+    """
+    Load topics from ir_datasets and standardize to have 'query' column.
+
+    Args:
+        dataset_name: Name of the dataset (e.g., 'disks45/nocr/trec-robust-2004')
+        use_title_desc: Whether to combine title and description for TREC topics
+
+    Returns:
+        pd.DataFrame: DataFrame with 'qid' and 'query' columns
+    """
+    logger.info(f"Loading dataset: {dataset_name}")
+
+    try:
+        dataset = pt.get_dataset(f"irds:{dataset_name}")
+        topics = dataset.get_topics()
+
+        # Check if we already have a 'query' column
+        if 'query' in topics.columns:
+            logger.info("Dataset already has 'query' column")
+            return topics
+
+        # Detect the appropriate query column
+        query_column = get_query_column_name(topics)
+
+        # Handle special case for TREC topics with title/description combination
+        if use_title_desc and 'title' in topics.columns and 'description' in topics.columns:
+            logger.info("Combining title and description for TREC topics")
+            topics['query'] = topics.apply(lambda row:
+                                           f"{row['title']} {row['description']}" if pd.notna(row['description']) and
+                                                                                     row['description'].strip()
+                                           else row['title'], axis=1)
+        else:
+            # Standard rename
+            topics = topics.rename(columns={query_column: "query"})
+
+        # Validate the result
+        if 'query' not in topics.columns:
+            raise ValueError("Failed to create 'query' column")
+
+        if 'qid' not in topics.columns:
+            raise ValueError("Dataset must have 'qid' column")
+
+        logger.info(f"Successfully loaded {len(topics)} topics")
+        logger.info(f"Sample query: {topics['query'].iloc[0][:100]}...")
+
+        return topics[['qid', 'query']]  # Return only essential columns
+
+    except Exception as e:
+        logger.error(f"Error loading dataset '{dataset_name}': {e}")
+        raise
+
+
 def clean_text(text):
     """
     Clean text by removing problematic characters and forcing it into ASCII,
@@ -249,6 +377,10 @@ def main():
 
     parser.add_argument("--index-path", required=True,
                         help="Path to Terrier index directory (the folder, not data.properties)")
+    parser.add_argument("--dataset", required=True,
+                     help="ir_datasets name (e.g., 'disks45/nocr/trec-robust-2004')")
+    parser.add_argument("--use-title-desc", action="store_true", default=False,
+                        help="For TREC topics, combine title and description fields (default: False)")
     parser.add_argument("--colbert-checkpoint", required=True,
                         help="Path to ColBERT checkpoint (.dnn)")
     parser.add_argument("--colbert-index-root", required=True,
@@ -299,9 +431,7 @@ def main():
 
     try:
         logger.info("Step 2: Loading dataset topics...")
-        dataset = pt.get_dataset("irds:disks45/nocr/trec-robust-2004")
-        topics = dataset.get_topics()
-        topics = topics.rename(columns={"title": "query"})
+        topics = load_and_standardize_topics(args.dataset, use_title_desc=args.use_title_desc)
         topics = preprocess_queries(topics)
         logger.info(f"--- Loaded {len(topics)} topics ---")
         if args.dry_run:

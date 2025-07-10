@@ -110,7 +110,10 @@ def create_colbert_index(dataset_name: str,
             index_root=index_root,
             index_name=index_name,
             chunksize=chunksize,
-            ids=True  # Store document IDs
+            ids=True,
+            nbits=2,
+            fp16=True
+
         )
 
         # Override the batch size after creation
