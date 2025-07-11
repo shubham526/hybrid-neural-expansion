@@ -13,7 +13,7 @@ DEFINITIVELY CORRECTED AND ROBUST VERSION:
 import logging
 import re
 import statistics
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from collections import Counter, defaultdict
 from pathlib import Path
 import numpy as np
@@ -109,6 +109,55 @@ class LuceneRM3Scorer:
             logger.error(f"Error in RM3 expansion for query '{query}': {e}", exc_info=True)
             return [], {}
 
+    def _extract_content_from_doc(self, doc, doc_id: str) -> Optional[str]:
+        """
+        Extracts, combines, truncates, and cleans text from a Pyserini document.
+        This is adapted from your suggested helper function.
+        """
+        try:
+            # First, try the direct 'contents' field.
+            doc_content = doc.get("contents")
+
+            # If no direct 'contents', fall back to the 'raw' JSON field.
+            if not doc_content:
+                raw_json = doc.get("raw")
+                if not raw_json:
+                    logger.warning(f"Document {doc_id}: Missing 'contents' and 'raw' fields—skipping.")
+                    return None
+
+                try:
+                    parsed = json.loads(raw_json)
+                    # Check for multiple fields and combine them.
+                    title = parsed.get("title", "")
+                    text = parsed.get("text", "")
+                    # Prioritize 'contents' within the JSON, then 'text', then other common fields.
+                    body = parsed.get("contents", text) or parsed.get("content", "") or parsed.get("abstract", "")
+
+                    content_parts = [part for part in [title, body] if part and part.strip()]
+                    doc_content = " ".join(content_parts)
+                except json.JSONDecodeError:
+                    logger.warning(f"Document {doc_id}: Failed to parse 'raw' field as JSON—skipping.")
+                    return None
+
+            if not doc_content:
+                logger.warning(f"Document {doc_id}: No text could be extracted from any known field.")
+                return None
+
+            # Truncate the text *before* heavy processing to improve performance.
+            max_length = 50000
+            if len(doc_content) > max_length:
+                logger.info(f"Truncating doc {doc_id} from {len(doc_content)} to {max_length} chars.")
+                doc_content = doc_content[:max_length]
+
+            # Clean the text
+            return doc_content
+
+        except Exception as e:
+            logger.error(f"Error processing document {doc_id}: {e}")
+            return None
+
+
+
     def _process_feedback_documents(self, score_docs) -> Tuple[Dict[str, float], Dict[str, Dict[str, int]]]:
         """
         Processes feedback documents to get term probabilities and build the
@@ -120,20 +169,14 @@ class LuceneRM3Scorer:
         doc_weights = self._normalize_scores(doc_scores)
 
         for score_doc, doc_weight in zip(score_docs, doc_weights):
-            doc = self.searcher.storedFields().document(score_doc.doc)
-            doc_content = doc.get("contents")
-            doc_id = doc.get("id") or "unknown_id"
+            pyserini_doc = self.searcher.storedFields().document(score_doc.doc)
+            doc_id = pyserini_doc.get("id") or f"internal_doc_{score_doc.doc}"
+
+            # Use the new helper function to get content
+            doc_content = self._extract_content_from_doc(pyserini_doc, doc_id)
+
             if not doc_content:
-                # Fallback: Try to extract from 'raw' (for Pyserini prebuilt indexes)
-                raw_json = doc.get("raw")
-                if raw_json:
-                    try:
-                        parsed = json.loads(raw_json)
-                        doc_content = parsed.get("contents", "")
-                    except json.JSONDecodeError:
-                        logger.warning(f"Document {doc_id}: Missing 'contents' field—attempted to extract from 'raw'.")
-                        logger.warning(f"Document {doc_id}: Failed to parse 'raw' field as JSON—skipping document.")
-                        continue  # Skip this document safely
+                continue
 
             term_freqs, doc_len = self._get_term_freqs_and_build_map(doc_content, original_term_counts)
             if doc_len == 0:
@@ -143,7 +186,7 @@ class LuceneRM3Scorer:
                 term_prob_in_doc = freq / doc_len
                 term_doc_probs[term] += term_prob_in_doc * doc_weight
 
-        return dict(term_doc_probs), original_term_counts
+        return dict(term_doc_probs), dict(original_term_counts)
 
     def _get_term_freqs_and_build_map(self, doc_content: str, original_term_counts: defaultdict) -> Tuple[Counter, int]:
         """

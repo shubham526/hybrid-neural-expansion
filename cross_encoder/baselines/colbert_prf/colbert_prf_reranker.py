@@ -164,37 +164,65 @@ def load_and_standardize_topics(dataset_name, use_title_desc=False):
         raise
 
 
-def clean_text(text):
+# def clean_text(text):
+#     """
+#     Clean text by removing problematic characters and forcing it into ASCII,
+#     which is safe for most standard ColBERT models.
+#     """
+#     if not text or pd.isna(text):
+#         return ""
+#
+#     # Convert to string to be safe
+#     text = str(text)
+#
+#     # 1. Normalize unicode characters to their base form (e.g., 'é' becomes 'e' + '´')
+#     # This is a crucial first step before ASCII conversion.
+#     text = unicodedata.normalize('NFKD', text)
+#
+#     # 2. **THE DEFINITIVE FIX**: Force the text into ASCII.
+#     # This encodes the string into raw ASCII bytes, ignoring any character
+#     # that isn't a standard ASCII character (this will remove problematic text).
+#     # It then decodes the bytes back into a clean Python string.
+#     text = text.encode('ascii', 'ignore').decode('utf-8')
+#
+#     # 3. Clean up multiple whitespaces that may have been introduced
+#     text = re.sub(r'\s+', ' ', text)
+#
+#     # 4. Remove any remaining control characters
+#     text = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', text)
+#
+#     # 5. Truncate very long text to avoid memory issues
+#     max_length = 10000  # Reasonable limit for document text
+#     if len(text) > max_length:
+#         text = text[:max_length]
+#
+#     return text.strip()
+
+def clean_text(text: str) -> str:
     """
-    Clean text by removing problematic characters and forcing it into ASCII,
-    which is safe for most standard ColBERT models.
+    A robust cleaning function safe for both TREC and BEIR datasets.
+    It truncates long documents, normalizes unicode, and removes control characters.
     """
     if not text or pd.isna(text):
         return ""
 
-    # Convert to string to be safe
     text = str(text)
 
-    # 1. Normalize unicode characters to their base form (e.g., 'é' becomes 'e' + '´')
-    # This is a crucial first step before ASCII conversion.
-    text = unicodedata.normalize('NFKD', text)
-
-    # 2. **THE DEFINITIVE FIX**: Force the text into ASCII.
-    # This encodes the string into raw ASCII bytes, ignoring any character
-    # that isn't a standard ASCII character (this will remove problematic text).
-    # It then decodes the bytes back into a clean Python string.
-    text = text.encode('ascii', 'ignore').decode('utf-8')
-
-    # 3. Clean up multiple whitespaces that may have been introduced
-    text = re.sub(r'\s+', ' ', text)
-
-    # 4. Remove any remaining control characters
-    text = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', text)
-
-    # 5. Truncate very long text to avoid memory issues
-    max_length = 10000  # Reasonable limit for document text
+    # 1. Truncate long text FIRST to prevent performance issues.
+    #    This is the key step that protects against Robust04 problems.
+    max_length = 50000  # A safe character limit
     if len(text) > max_length:
         text = text[:max_length]
+
+    # 2. Normalize unicode to a standard form. This is generally safe.
+    text = unicodedata.normalize('NFC', text)
+
+    # 3. Remove only unprintable C0 and C1 control characters.
+    #    This is much safer than forcing everything to ASCII.
+    text = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', text)
+
+    # 4. Consolidate whitespace.
+    text = re.sub(r'\s+', ' ', text)
 
     return text.strip()
 
@@ -203,6 +231,10 @@ def preprocess_documents(df):
     """
     Preprocess document text to handle problematic characters.
     """
+
+    # print("--- RAW DATA FROM BM25 ---")
+    # print(df.head())
+    # print("--------------------------")
     if 'text' not in df.columns:
         return df
 

@@ -305,16 +305,16 @@ class PyTerrierProcessor:
             def ir_dataset_generate():
                 """Generator that yields documents in PyTerrier format with text storage."""
                 print("Generating documents from ir_datasets...")
+                debug_counter = 0
 
 
                 for doc in tqdm(self.dataset.docs_iter(), desc="Processing documents", total=self.dataset.docs_count()):
 
-                    # print(doc.doc_text)
-                    # print(doc.doc_id)
 
 
                     # Extract document text using the same logic as IRDatasetHandler
                     doc_text = self._extract_document_text_for_indexing(doc)
+
 
                     if doc_text.strip():  # Only index non-empty documents
                         yield {
