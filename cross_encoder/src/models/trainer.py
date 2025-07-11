@@ -293,16 +293,28 @@ class EvaluationAwareTrainer:
                 torch.save(self.model.state_dict(), best_model_path)
 
                 # Save model info with current performance
+                # if hasattr(self.model, 'get_learned_weights'):
+                #     alpha, beta = self.model.get_learned_weights()
+                # else:
+                #     alpha, beta = 0.5, 0.5
+                #
+                # best_model_info = {
+                #     'epoch': epoch,
+                #     'best_score': metric_score,
+                #     'metric': self.eval_metric,
+                #     'learned_weights': {'alpha': alpha, 'beta': beta},
+                #     'model_path': str(best_model_path)
+                # }
                 if hasattr(self.model, 'get_learned_weights'):
-                    alpha, beta = self.model.get_learned_weights()
+                    alpha, beta, lambda_val = self.model.get_learned_weights()
                 else:
-                    alpha, beta = 0.5, 0.5
+                    alpha, beta, lambda_val = 0.5, 0.5, 0.5
 
                 best_model_info = {
                     'epoch': epoch,
                     'best_score': metric_score,
                     'metric': self.eval_metric,
-                    'learned_weights': {'alpha': alpha, 'beta': beta},
+                    'learned_weights': {'alpha': alpha, 'beta': beta, 'expansion_weight': lambda_val},
                     'model_path': str(best_model_path)
                 }
 
@@ -343,9 +355,12 @@ class EvaluationAwareTrainer:
 
         # Track weights
         if hasattr(self.model, 'alpha'):
-            epoch_start_alpha = self.model.alpha.item()
-            epoch_start_beta = self.model.beta.item()
-            logger.info(f"Epoch {epoch} starting weights: α={epoch_start_alpha:.6f}, β={epoch_start_beta:.6f}")
+            # epoch_start_alpha = self.model.alpha.item()
+            # epoch_start_beta = self.model.beta.item()
+            # logger.info(f"Epoch {epoch} starting weights: α={epoch_start_alpha:.6f}, β={epoch_start_beta:.6f}")
+            epoch_start_alpha, epoch_start_beta, epoch_start_lambda = self.model.get_learned_weights()
+            logger.info(
+                f"Epoch {epoch} starting weights: α={epoch_start_alpha:.6f}, β={epoch_start_beta:.6f}, λ={epoch_start_lambda:.6f}")
 
         for step, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch}")):
             global_step = epoch * len(dataloader) + step
@@ -404,12 +419,20 @@ class EvaluationAwareTrainer:
 
         # Epoch summary
         if hasattr(self.model, 'alpha'):
-            epoch_end_alpha = self.model.alpha.item()
-            epoch_end_beta = self.model.beta.item()
+            # epoch_end_alpha = self.model.alpha.item()
+            # epoch_end_beta = self.model.beta.item()
+            # alpha_change = epoch_end_alpha - epoch_start_alpha
+            # beta_change = epoch_end_beta - epoch_start_beta
+            #
+            # logger.info(f"Epoch {epoch} weight changes: Δα={alpha_change:+.6f}, Δβ={beta_change:+.6f}")
+
+            epoch_end_alpha, epoch_end_beta, epoch_end_lambda = self.model.get_learned_weights()
             alpha_change = epoch_end_alpha - epoch_start_alpha
             beta_change = epoch_end_beta - epoch_start_beta
+            lambda_change = epoch_end_lambda - epoch_start_lambda
 
-            logger.info(f"Epoch {epoch} weight changes: Δα={alpha_change:+.6f}, Δβ={beta_change:+.6f}")
+            logger.info(
+                f"Epoch {epoch} weight changes: Δα={alpha_change:+.6f}, Δβ={beta_change:+.6f}, Δλ={lambda_change:+.6f}")
 
         return total_loss / num_batches if num_batches > 0 else 0.0
 
@@ -568,14 +591,19 @@ class EvaluationAwareTrainer:
             'val_loss': [],
             'alpha_values': [],
             'beta_values': [],
+            'lambda_values': [],  # NEW
             'dev_scores': [],  # NEW: Track dev set performance
             'best_epochs': []   # NEW: Track when best model was saved
         }
 
         # Initial weights
         if hasattr(self.model, 'get_learned_weights'):
-            initial_alpha, initial_beta = self.model.get_learned_weights()
-            logger.info(f"Initial weights: α={initial_alpha:.6f}, β={initial_beta:.6f}")
+            initial_alpha, initial_beta, initial_lambda = self.model.get_learned_weights()  # Modified
+            logger.info(
+                f"Initial weights: α={initial_alpha:.6f}, β={initial_beta:.6f}, λ={initial_lambda:.6f}")  # Modified
+
+            # initial_alpha, initial_beta = self.model.get_learned_weights()
+            # logger.info(f"Initial weights: α={initial_alpha:.6f}, β={initial_beta:.6f}")
 
         for epoch in range(num_epochs):
             logger.info(f"\n{'='*50}")
@@ -588,10 +616,12 @@ class EvaluationAwareTrainer:
 
             # Track weights
             if hasattr(self.model, 'get_learned_weights'):
-                alpha, beta = self.model.get_learned_weights()
+                alpha, beta, lambda_val = self.model.get_learned_weights()  # Modified
                 history['alpha_values'].append(alpha)
                 history['beta_values'].append(beta)
-                logger.info(f"Epoch {epoch + 1}: Loss={train_loss:.4f}, α={alpha:.6f}, β={beta:.6f}")
+                history['lambda_values'].append(lambda_val)  # NEW
+                logger.info(
+                    f"Epoch {epoch + 1}: Loss={train_loss:.4f}, α={alpha:.6f}, β={beta:.6f}, λ={lambda_val:.6f}")  # Modified
 
             # Validation loss (original functionality)
             if val_dataset:
@@ -615,8 +645,8 @@ class EvaluationAwareTrainer:
 
         # Final summary
         if hasattr(self.model, 'get_learned_weights'):
-            final_alpha, final_beta = self.model.get_learned_weights()
-            logger.info(f"\nFinal weights: α={final_alpha:.6f}, β={final_beta:.6f}")
+            final_alpha, final_beta, final_lambda = self.model.get_learned_weights()  # Modified
+            logger.info(f"\nFinal weights: α={final_alpha:.6f}, β={final_beta:.6f}, λ={final_lambda:.6f}")  # Modified
 
         if self.evaluator:
             logger.info(f"Best model: Epoch {self.best_epoch}, {self.eval_metric}={self.best_score:.4f}")

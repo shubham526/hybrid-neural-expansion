@@ -84,10 +84,12 @@ class ConfigurableNeuralReranker(nn.Module):
         # Learnable parameters (always needed for both methods)
         self.alpha = nn.Parameter(torch.tensor(0.5, device=self.device, dtype=torch.float32))
         self.beta = nn.Parameter(torch.tensor(0.5, device=self.device, dtype=torch.float32))
+        self.expansion_weight = nn.Parameter(torch.tensor(0.0, device=self.device, dtype=torch.float32))
 
         # Register parameters explicitly
         self.register_parameter('alpha', self.alpha)
         self.register_parameter('beta', self.beta)
+        self.register_parameter('expansion_weight', self.expansion_weight)
 
         # Setup scoring layers based on method
         if scoring_method == "neural":
@@ -263,8 +265,9 @@ class ConfigurableNeuralReranker(nn.Module):
         # Combine with original query
         if total_weight > 1e-8:
             # FIX 6: Create mixing weight on correct device
-            expansion_weight = torch.tensor(0.3, device=self.device, dtype=torch.float32)
-            expansion_weight = torch.sigmoid(expansion_weight)
+            # expansion_weight = torch.tensor(0.3, device=self.device, dtype=torch.float32)
+            # expansion_weight = torch.sigmoid(expansion_weight)
+            expansion_weight = torch.sigmoid(self.expansion_weight)
 
             enhanced_query = (1 - expansion_weight) * query_embedding + expansion_weight * (weighted_term_sum / total_weight)
         else:
@@ -345,9 +348,11 @@ class ConfigurableNeuralReranker(nn.Module):
         # Return as scalar tensor
         return cosine_sim.squeeze()
 
-    def get_learned_weights(self) -> Tuple[float, float]:
-        """Get current learned α and β values."""
-        return self.alpha.item(), self.beta.item()
+    def get_learned_weights(self) -> Tuple[float, float, float]:
+        """Get current learned α, β, and λ values."""
+        # Get the value of lambda by applying the sigmoid
+        expansion_weight = torch.sigmoid(self.expansion_weight).item()
+        return self.alpha.item(), self.beta.item(), expansion_weight
 
     def get_scoring_method(self) -> str:
         """Get current scoring method."""
