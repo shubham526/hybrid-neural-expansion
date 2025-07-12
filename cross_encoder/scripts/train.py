@@ -552,8 +552,8 @@ def main():
                 reranker = reranker.to(device)
                 print(f"Model moved to consistent device: {device}")
 
-            initial_alpha, initial_beta = reranker.get_learned_weights()
-            logger.info(f"Initial weights: α={initial_alpha:.3f}, β={initial_beta:.3f}")
+            initial_alpha, initial_beta, initial_lambda = reranker.get_learned_weights()
+            logger.info(f"Initial weights: α={initial_alpha:.3f}, β={initial_beta:.3f}, λ={initial_lambda:.3f}")
             logger.info(f"Scoring method: {reranker.get_scoring_method()}")
 
         # Create trainer
@@ -589,7 +589,7 @@ def main():
             torch.save(reranker.state_dict(), final_model_path)
 
             # Get final weights
-            final_alpha, final_beta = reranker.get_learned_weights()
+            final_alpha, final_beta, final_lambda = reranker.get_learned_weights()  # MODIFIED
 
             # Create comprehensive model info
             model_info = {
@@ -603,7 +603,8 @@ def main():
                 'scoring_method': args.scoring_method,  # NEW field
                 'learned_weights': {
                     'alpha': final_alpha,
-                    'beta': final_beta
+                    'beta': final_beta,
+                    'expansion_weight': final_lambda,
                 },
                 'training_config': {
                     'num_epochs': args.num_epochs,
@@ -640,9 +641,11 @@ def main():
 
             # Log training completion
             logger.info("TRAINING COMPLETED!")
-            logger.info(f"Initial weights: α={initial_alpha:.4f}, β={initial_beta:.4f}")
-            logger.info(f"Final weights: α={final_alpha:.4f}, β={final_beta:.4f}")
-            logger.info(f"Weight changes: Δα={final_alpha - initial_alpha:+.4f}, Δβ={final_beta - initial_beta:+.4f}")
+            logger.info(f"Initial weights: α={initial_alpha:.4f}, β={initial_beta:.4f}, λ={initial_lambda:.4f}")
+            logger.info(f"Final weights: α={final_alpha:.4f}, β={final_beta:.4f}, λ={final_lambda:.4f}")
+            logger.info(
+                f"Weight changes: Δα={final_alpha - initial_alpha:+.4f}, Δβ={final_beta - initial_beta:+.4f}, Δλ={final_lambda - initial_lambda:+.4f}")
+            # MODIFIED BLOCK END
 
             # Log best model info
             if hasattr(trainer, 'best_score') and trainer.best_score > 0:
