@@ -1,75 +1,64 @@
 #!/usr/bin/env python3
 """
-Intrinsic Evaluation: Term Re-weighting Quality via Rank Correlation
-(Optimized version using existing features and run files)
+Clean Intrinsic Evaluation: Term Re-weighting Quality via Rank Correlation
 
 This script evaluates whether MEQE's hybrid weights are better aligned with the
-"true" utility of expansion terms than the original RM3 weights, using existing
-features and run files to avoid recomputation.
+"true" utility of expansion terms than the original RM3 weights.
+
+Expects pre-computed per-query evaluation files and filtered features.
 """
 
 import argparse
 import logging
 import sys
 import numpy as np
-import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
-from collections import defaultdict
 from tqdm import tqdm
 import json
 from scipy.stats import spearmanr, ttest_rel
 import matplotlib.pyplot as plt
 import seaborn as sns
-import subprocess
-import tempfile
 
 # Add project root to path
 project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from cross_encoder.src.models.reranker2 import create_neural_reranker
-from cross_encoder.src.utils.file_utils import ensure_dir, save_json, load_json
+from cross_encoder.src.models.reranker import create_neural_reranker
+from cross_encoder.src.utils.file_utils import ensure_dir, save_json
 from cross_encoder.src.utils.logging_utils import setup_experiment_logging, log_experiment_info, TimedOperation
 
 logger = logging.getLogger(__name__)
 
 
-class OptimizedIntrinsicEvaluator:
+class CleanIntrinsicEvaluator:
     """
-    Optimized intrinsic evaluator using existing features and run files.
+    Clean intrinsic evaluator using pre-computed files.
     """
 
     def __init__(self,
                  features_file: str,
-                 baseline_run_file: str,
-                 expanded_run_file: str,
-                 qrels_file: str,
-                 trec_eval_path: str,
+                 baseline_eval_file: str,
+                 expanded_eval_file: str,
                  output_dir: Path):
         """
-        Initialize the optimized intrinsic evaluator.
+        Initialize the evaluator.
 
         Args:
-            features_file: Path to features.jsonl file with RM3 terms and weights
-            baseline_run_file: Path to BM25 baseline run file
-            expanded_run_file: Path to expanded run file (e.g., best RM3 alpha)
-            qrels_file: Path to qrels file
-            trec_eval_path: Path to trec_eval binary
+            features_file: Path to features.jsonl file
+            baseline_eval_file: Path to baseline per-query eval file
+            expanded_eval_file: Path to expanded per-query eval file
             output_dir: Output directory for results
         """
         self.features_file = Path(features_file)
-        self.baseline_run_file = Path(baseline_run_file)
-        self.expanded_run_file = Path(expanded_run_file)
-        self.qrels_file = Path(qrels_file)
-        self.trec_eval_path = Path(trec_eval_path)
+        self.baseline_eval_file = Path(baseline_eval_file)
+        self.expanded_eval_file = Path(expanded_eval_file)
         self.output_dir = ensure_dir(output_dir)
 
-        logger.info(f"OptimizedIntrinsicEvaluator initialized:")
+        logger.info(f"CleanIntrinsicEvaluator initialized:")
         logger.info(f"  Features file: {features_file}")
-        logger.info(f"  Baseline run: {baseline_run_file}")
-        logger.info(f"  Expanded run: {expanded_run_file}")
-        logger.info(f"  Qrels file: {qrels_file}")
+        logger.info(f"  Baseline eval: {baseline_eval_file}")
+        logger.info(f"  Expanded eval: {expanded_eval_file}")
 
     def load_features(self) -> Dict[str, Dict]:
         """Load features from JSONL file."""
@@ -85,150 +74,87 @@ class OptimizedIntrinsicEvaluator:
         logger.info(f"Loaded features for {len(features)} queries")
         return features
 
-    def calculate_recall_scores(self, run_file: Path, filter_queries: set = None) -> Dict[str, float]:
-        """Calculate recall@1000 scores using trec_eval, optionally filtering to specific queries."""
-        logger.info(f"Calculating recall@1000 scores for: {run_file}")
-
-        # If filtering is needed, create a temporary filtered run file
-        if filter_queries:
-            import tempfile
-            temp_run_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.run')
-
-            # Filter the run file to only include specified queries
-            with open(run_file, 'r') as f_in:
-                for line in f_in:
-                    parts = line.strip().split()
-                    if len(parts) >= 6:
-                        query_id = parts[0]
-                        if query_id in filter_queries:
-                            temp_run_file.write(line)
-
-            temp_run_file.close()
-            run_file_to_use = Path(temp_run_file.name)
-            logger.info(f"Created filtered run file with {len(filter_queries)} queries")
-        else:
-            run_file_to_use = run_file
-
-        try:
-            # Run trec_eval to get per-query recall@1000 scores
-            cmd = [
-                str(self.trec_eval_path),
-                '-q',  # Per-query evaluation
-                '-m', 'recall.1000',  # Recall at 1000
-                str(self.qrels_file),
-                str(run_file_to_use)
-            ]
-
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-
-            # Parse trec_eval output
-            recall_scores = {}
-            for line in result.stdout.split('\n'):
-                if line.strip() and 'recall.1000' in line:
-                    parts = line.split()
-                    if len(parts) >= 3 and parts[0] == 'recall.1000':
-                        query_id = parts[1]
-                        score = float(parts[2])
-                        recall_scores[query_id] = score
-
-            logger.info(f"Calculated recall@1000 for {len(recall_scores)} queries")
-            return recall_scores
-
-        except subprocess.CalledProcessError as e:
-            logger.error(f"trec_eval failed: {e}")
-            logger.error(f"stderr: {e.stderr}")
-            raise
-        finally:
-            # Clean up temporary file if created
-            if filter_queries and run_file_to_use != run_file:
-                try:
-                    run_file_to_use.unlink()
-                except:
-                    pass
-
-    def calculate_individual_term_utilities(self,
-                                            features: Dict[str, Dict],
-                                            baseline_recalls: Dict[str, float]) -> Dict[str, Dict[str, float]]:
+    def load_eval_scores(self, eval_file: Path, metric: str = "recall.1000") -> Dict[str, float]:
         """
-        Calculate utility scores for individual terms using single-term expansion.
+        Load per-query evaluation scores from trec_eval output file.
 
-        This creates individual runs for each term and measures the recall improvement.
+        Expected format: metric query_id score
+        e.g., "recall.1000 301 0.4567"
         """
-        logger.info("Calculating individual term utilities...")
+        logger.info(f"Loading {metric} scores from: {eval_file}")
 
-        # Create a temporary directory for individual term runs
-        temp_dir = self.output_dir / "temp_term_runs"
-        ensure_dir(temp_dir)
+        scores = {}
+        with open(eval_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 3 and parts[0] == metric:
+                    query_id = parts[1]
+                    score = float(parts[2])
+                    scores[query_id] = score
+
+        logger.info(f"Loaded {metric} scores for {len(scores)} queries")
+
+        # Show sample scores
+        if scores:
+            sample_queries = list(scores.keys())[:3]
+            logger.info(f"Sample {metric} scores:")
+            for qid in sample_queries:
+                logger.info(f"  Query {qid}: {scores[qid]:.4f}")
+
+        return scores
+
+    def calculate_utility_from_score_difference(self,
+                                                features: Dict[str, Dict],
+                                                baseline_scores: Dict[str, float],
+                                                expanded_scores: Dict[str, float]) -> Dict[str, Dict[str, float]]:
+        """
+        Calculate term utilities by distributing the score improvement from expanded vs baseline.
+        """
+        logger.info("Calculating term utilities from score difference...")
+        logger.info(f"Input data sizes:")
+        logger.info(f"  Features: {len(features)} queries")
+        logger.info(f"  Baseline scores: {len(baseline_scores)} queries")
+        logger.info(f"  Expanded scores: {len(expanded_scores)} queries")
+
+        # Check query ID overlap
+        feature_queries = set(features.keys())
+        baseline_queries = set(baseline_scores.keys())
+        expanded_queries = set(expanded_scores.keys())
+
+        all_overlap = feature_queries & baseline_queries & expanded_queries
+        logger.info(f"Common queries across all datasets: {len(all_overlap)}")
+
+        if len(all_overlap) == 0:
+            logger.error("No queries found in all three datasets!")
+            logger.error(f"Sample feature queries: {list(feature_queries)[:5]}")
+            logger.error(f"Sample baseline queries: {list(baseline_queries)[:5]}")
+            logger.error(f"Sample expanded queries: {list(expanded_queries)[:5]}")
+            return {}
 
         term_utilities = {}
-
-        for query_id, query_data in tqdm(features.items(), desc="Processing queries"):
-            if query_id not in baseline_recalls:
-                logger.warning(f"No baseline recall for query {query_id}")
-                continue
-
-            baseline_recall = baseline_recalls[query_id]
-            query_text = query_data['query_text']
-            term_features = query_data['term_features']
-
-            query_utilities = {}
-
-            for term, term_data in term_features.items():
-                # Create expanded query with single term
-                # Format: original_query term^0.5
-                expanded_query = f"{query_text} {term}^0.5"
-
-                # Create a temporary run file for this single term expansion
-                temp_run_file = temp_dir / f"query_{query_id}_term_{term}.run"
-
-                try:
-                    # Here we would ideally run the expanded query through your retrieval system
-                    # For now, we'll estimate utility based on RM3 weight and semantic similarity
-                    # This is a reasonable approximation for the intrinsic evaluation
-
-                    rm_weight = term_data['rm_weight']
-                    semantic_score = term_data['semantic_score']
-
-                    # Estimate utility as a combination of RM3 weight and semantic similarity
-                    # This simulates the effect of adding the term to the query
-                    estimated_utility = (rm_weight * 0.7 + semantic_score * 0.3) * baseline_recall * 0.1
-
-                    query_utilities[term] = estimated_utility
-
-                except Exception as e:
-                    logger.warning(f"Error processing term {term} for query {query_id}: {e}")
-                    query_utilities[term] = 0.0
-
-            term_utilities[query_id] = query_utilities
-
-        # Clean up temporary directory
-        import shutil
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-        logger.info(f"Calculated term utilities for {len(term_utilities)} queries")
-        return term_utilities
-
-    def calculate_utility_from_run_difference(self,
-                                              features: Dict[str, Dict],
-                                              baseline_recalls: Dict[str, float],
-                                              expanded_recalls: Dict[str, float]) -> Dict[str, Dict[str, float]]:
-        """
-        Calculate term utilities by distributing the overall improvement from expanded run.
-
-        This approach uses the difference between baseline and expanded run recalls,
-        then distributes this improvement among terms based on their weights.
-        """
-        logger.info("Calculating term utilities from run difference...")
-
-        term_utilities = {}
+        queries_processed = 0
+        queries_with_improvement = 0
+        total_improvements = []
 
         for query_id, query_data in features.items():
-            if query_id not in baseline_recalls or query_id not in expanded_recalls:
+            if query_id not in baseline_scores or query_id not in expanded_scores:
                 continue
 
-            baseline_recall = baseline_recalls[query_id]
-            expanded_recall = expanded_recalls[query_id]
-            total_improvement = expanded_recall - baseline_recall
+            queries_processed += 1
+            baseline_score = baseline_scores[query_id]
+            expanded_score = expanded_scores[query_id]
+            total_improvement = expanded_score - baseline_score
+            total_improvements.append(total_improvement)
+
+            # Debug for first few queries
+            if queries_processed <= 3:
+                logger.info(f"Query {query_id}:")
+                logger.info(f"  Baseline score: {baseline_score:.4f}")
+                logger.info(f"  Expanded score: {expanded_score:.4f}")
+                logger.info(f"  Total improvement: {total_improvement:.4f}")
+
+            if total_improvement > 0:
+                queries_with_improvement += 1
 
             term_features = query_data['term_features']
 
@@ -249,7 +175,17 @@ class OptimizedIntrinsicEvaluator:
 
             term_utilities[query_id] = query_utilities
 
-        logger.info(f"Calculated distributed term utilities for {len(term_utilities)} queries")
+        # Summary statistics
+        if total_improvements:
+            mean_improvement = np.mean(total_improvements)
+            positive_improvements = sum(1 for x in total_improvements if x > 0)
+            logger.info(f"Utility calculation summary:")
+            logger.info(f"  Queries processed: {queries_processed}")
+            logger.info(f"  Mean improvement: {mean_improvement:.4f}")
+            logger.info(
+                f"  Queries with positive improvement: {positive_improvements} ({positive_improvements / len(total_improvements) * 100:.1f}%)")
+            logger.info(f"  Final utility scores: {len(term_utilities)} queries")
+
         return term_utilities
 
     def evaluate_meqe_model(self,
@@ -267,13 +203,19 @@ class OptimizedIntrinsicEvaluator:
         # Load checkpoint
         import torch
         checkpoint = torch.load(model_checkpoint_path, map_location='cpu')
-        model.load_state_dict(checkpoint, strict=False)
+
+        # Handle both strict and non-strict loading
+        try:
+            model.load_state_dict(checkpoint, strict=False)
+        except RuntimeError as e:
+            logger.warning(f"Strict loading failed, trying non-strict: {e}")
+            model.load_state_dict(checkpoint, strict=False)
+
         model.eval()
 
         # Get learned weights
-        # alpha, beta, lambda_val = model.get_learned_weights()
-        alpha, beta = model.get_learned_weights()
-        logger.info(f"Model weights: α={alpha:.4f}, β={beta:.4f}")
+        alpha, beta, lambda_val = model.get_learned_weights()
+        logger.info(f"Model weights: α={alpha:.4f}, β={beta:.4f}, λ={lambda_val:.4f}")
 
         meqe_weights = {}
 
@@ -288,7 +230,6 @@ class OptimizedIntrinsicEvaluator:
 
                     # Calculate MEQE hybrid weight (always uses both components)
                     hybrid_weight = alpha * rm_weight + beta * semantic_score
-
                     term_weights[term] = hybrid_weight
 
                 meqe_weights[query_id] = term_weights
@@ -304,14 +245,40 @@ class OptimizedIntrinsicEvaluator:
         Calculate Spearman rank correlations between utility scores and different weighting schemes.
         """
         logger.info("Calculating rank correlations...")
+        logger.info(f"Input data sizes:")
+        logger.info(f"  Utility scores: {len(utility_scores)} queries")
+        logger.info(f"  Features: {len(features)} queries")
+        logger.info(f"  MEQE weights: {len(meqe_weights)} queries")
 
         rm3_correlations = []
         meqe_correlations = []
         query_results = {}
 
-        for query_id in utility_scores.keys():
-            if query_id not in features or query_id not in meqe_weights:
-                continue
+        # Check what queries we have in each dataset
+        utility_queries = set(utility_scores.keys())
+        feature_queries = set(features.keys())
+        meqe_queries = set(meqe_weights.keys())
+
+        common_queries = utility_queries & feature_queries & meqe_queries
+        logger.info(f"Common queries across all datasets: {len(common_queries)}")
+
+        if len(common_queries) == 0:
+            logger.error("No common queries found!")
+            return {
+                'error': 'No common queries found',
+                'debug_info': {
+                    'utility_queries': len(utility_queries),
+                    'feature_queries': len(feature_queries),
+                    'meqe_queries': len(meqe_queries)
+                },
+                'raw_correlations': {'rm3': [], 'meqe': []}
+            }
+
+        queries_processed = 0
+        queries_with_sufficient_terms = 0
+
+        for query_id in common_queries:
+            queries_processed += 1
 
             # Get data for this query
             utility_dict = utility_scores[query_id]
@@ -319,11 +286,17 @@ class OptimizedIntrinsicEvaluator:
             meqe_dict = meqe_weights[query_id]
 
             # Ensure we have the same terms in all dictionaries
-            common_terms = set(utility_dict.keys()) & set(term_features.keys()) & set(meqe_dict.keys())
+            utility_terms = set(utility_dict.keys())
+            feature_terms = set(term_features.keys())
+            meqe_terms = set(meqe_dict.keys())
+
+            common_terms = utility_terms & feature_terms & meqe_terms
 
             if len(common_terms) < 3:  # Need at least 3 points for correlation
-                logger.warning(f"Skipping query {query_id} - insufficient common terms ({len(common_terms)})")
+                logger.debug(f"Skipping query {query_id} - insufficient common terms ({len(common_terms)})")
                 continue
+
+            queries_with_sufficient_terms += 1
 
             # Create aligned lists
             utility_values = []
@@ -334,6 +307,13 @@ class OptimizedIntrinsicEvaluator:
                 utility_values.append(utility_dict[term])
                 rm3_values.append(term_features[term]['rm_weight'])
                 meqe_values.append(meqe_dict[term])
+
+            # Debug for first query
+            if queries_with_sufficient_terms == 1:
+                logger.info(f"First valid query {query_id} sample data:")
+                logger.info(f"  Sample utility values: {[f'{x:.4f}' for x in utility_values[:3]]}")
+                logger.info(f"  Sample RM3 values: {[f'{x:.4f}' for x in rm3_values[:3]]}")
+                logger.info(f"  Sample MEQE values: {[f'{x:.4f}' for x in meqe_values[:3]]}")
 
             # Calculate correlations
             try:
@@ -352,18 +332,22 @@ class OptimizedIntrinsicEvaluator:
                     'rm3_p_value': p_rm3 if not np.isnan(rho_rm3) else 1.0,
                     'meqe_p_value': p_meqe if not np.isnan(rho_meqe) else 1.0,
                     'num_terms': len(common_terms),
-                    'baseline_utility_range': max(utility_values) - min(utility_values) if utility_values else 0,
+                    'utility_range': max(utility_values) - min(utility_values) if utility_values else 0,
                     'rm3_weight_range': max(rm3_values) - min(rm3_values) if rm3_values else 0,
                     'meqe_weight_range': max(meqe_values) - min(meqe_values) if meqe_values else 0
                 }
+
+                if queries_with_sufficient_terms <= 3:
+                    logger.info(f"Query {query_id} correlations: RM3={rho_rm3:.4f}, MEQE={rho_meqe:.4f}")
 
             except Exception as e:
                 logger.warning(f"Error calculating correlation for query {query_id}: {e}")
                 continue
 
-        # Calculate summary statistics
-        rm3_correlations = np.array(rm3_correlations)
-        meqe_correlations = np.array(meqe_correlations)
+        logger.info(f"Processed {queries_processed} queries")
+        logger.info(f"Queries with sufficient terms: {queries_with_sufficient_terms}")
+        logger.info(f"Valid RM3 correlations: {len(rm3_correlations)}")
+        logger.info(f"Valid MEQE correlations: {len(meqe_correlations)}")
 
         # Ensure we have paired data for t-test
         valid_pairs = []
@@ -372,8 +356,17 @@ class OptimizedIntrinsicEvaluator:
                 valid_pairs.append((results['rm3_correlation'], results['meqe_correlation']))
 
         if len(valid_pairs) < 2:
-            logger.error("Insufficient valid correlation pairs for statistical testing")
-            return {}
+            logger.error(f"Insufficient valid correlation pairs for statistical testing: {len(valid_pairs)}")
+            return {
+                'error': 'Insufficient valid correlation pairs',
+                'debug_info': {
+                    'queries_processed': queries_processed,
+                    'queries_with_sufficient_terms': queries_with_sufficient_terms,
+                    'valid_pairs': len(valid_pairs)
+                },
+                'per_query_results': query_results,
+                'raw_correlations': {'rm3': [], 'meqe': []}
+            }
 
         paired_rm3, paired_meqe = zip(*valid_pairs)
         paired_rm3 = np.array(paired_rm3)
@@ -416,15 +409,39 @@ class OptimizedIntrinsicEvaluator:
         return results
 
     def create_visualizations(self, results: Dict[str, Any]) -> None:
-        """Create comprehensive visualizations for the correlation results."""
+        """Create visualizations for the correlation results."""
         logger.info("Creating visualizations...")
+
+        # Check if we have valid results
+        if 'error' in results or not results.get('raw_correlations'):
+            logger.error("Cannot create visualizations - insufficient data")
+
+            # Create a simple error plot
+            fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+            ax.text(0.5, 0.5, 'Insufficient Data for Correlation Analysis\n\nPossible Issues:\n' +
+                    '• Query ID mismatch between files\n• Too few terms per query\n• Constant utility values\n• No score improvements\n\n' +
+                    f'Debug Info: {results.get("debug_info", "N/A")}',
+                    ha='center', va='center', fontsize=12,
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="lightcoral"))
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.set_title('Intrinsic Evaluation - Error')
+            ax.axis('off')
+
+            plot_path = self.output_dir / 'intrinsic_evaluation_error.png'
+            plt.tight_layout()
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            logger.info(f"Error visualization saved to: {plot_path}")
+            return
 
         plt.style.use('default')
         sns.set_palette("husl")
 
         # Create figure with subplots
-        fig, axes = plt.subplots(2, 3, figsize=(20, 12))
-        fig.suptitle('Intrinsic Evaluation: Term Re-weighting Quality Analysis', fontsize=16, fontweight='bold')
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        fig.suptitle('Intrinsic Evaluation: Term Re-weighting Quality', fontsize=16, fontweight='bold')
 
         # 1. Correlation comparison boxplot
         ax1 = axes[0, 0]
@@ -463,56 +480,21 @@ class OptimizedIntrinsicEvaluator:
         ax2.grid(True, alpha=0.3)
 
         # 3. Histogram of correlation differences
-        ax3 = axes[0, 2]
+        ax3 = axes[1, 0]
         differences = np.array(meqe_corr) - np.array(rm3_corr)
-        ax3.hist(differences, bins=20, alpha=0.7, color='purple', edgecolor='black')
+        ax3.hist(differences, bins=15, alpha=0.7, color='purple', edgecolor='black')
         ax3.axvline(x=0, color='red', linestyle='--', alpha=0.7, label='No difference')
         ax3.axvline(x=np.mean(differences), color='green', linestyle='-', linewidth=2,
-                    label=f'Mean diff: {np.mean(differences):.4f}')
-        ax3.set_xlabel('MEQE Correlation - RM3 Correlation')
-        ax3.set_ylabel('Number of Queries')
+                    label=f'Mean diff: {np.mean(differences):.3f}')
+        ax3.set_xlabel('Correlation Difference (MEQE - RM3)')
+        ax3.set_ylabel('Frequency')
         ax3.set_title('Distribution of Correlation Differences')
         ax3.legend()
         ax3.grid(True, alpha=0.3)
 
-        # 4. Query improvement analysis
-        ax4 = axes[1, 0]
-        improved = results['summary']['queries_improved']
-        degraded = results['summary']['queries_degraded']
-        unchanged = results['summary']['queries_unchanged']
-
-        categories = ['Improved', 'Degraded', 'Unchanged']
-        values = [improved, degraded, unchanged]
-        colors = ['green', 'red', 'gray']
-
-        bars = ax4.bar(categories, values, color=colors, alpha=0.7)
-        ax4.set_title('Query-level Performance Changes')
-        ax4.set_ylabel('Number of Queries')
-
-        # Add value labels on bars
-        for bar, value in zip(bars, values):
-            height = bar.get_height()
-            ax4.text(bar.get_x() + bar.get_width() / 2., height + 0.5,
-                     f'{value}', ha='center', va='bottom')
-
-        # 5. Correlation vs Query Characteristics
-        ax5 = axes[1, 1]
-        query_results = results['per_query_results']
-
-        # Plot correlation difference vs number of terms
-        num_terms = [res['num_terms'] for res in query_results.values()]
-        corr_diffs = [res['meqe_correlation'] - res['rm3_correlation'] for res in query_results.values()]
-
-        ax5.scatter(num_terms, corr_diffs, alpha=0.6)
-        ax5.axhline(y=0, color='red', linestyle='--', alpha=0.5)
-        ax5.set_xlabel('Number of Terms')
-        ax5.set_ylabel('Correlation Difference (MEQE - RM3)')
-        ax5.set_title('Improvement vs Query Complexity')
-        ax5.grid(True, alpha=0.3)
-
-        # 6. Summary statistics table
-        ax6 = axes[1, 2]
-        ax6.axis('off')
+        # 4. Summary statistics table
+        ax4 = axes[1, 1]
+        ax4.axis('off')
 
         summary = results['summary']
         table_data = [
@@ -521,344 +503,431 @@ class OptimizedIntrinsicEvaluator:
              f"{summary['meqe_mean_correlation']:.4f}",
              f"{summary['correlation_difference']:.4f}"],
             ['Median Correlation', f"{summary['rm3_median_correlation']:.4f}",
-             f"{summary['meqe_median_correlation']:.4f}", ''],
-            ['Std Deviation', f"{summary['rm3_std_correlation']:.4f}",
+             f"{summary['meqe_median_correlation']:.4f}",
+             f"{summary['meqe_median_correlation'] - summary['rm3_median_correlation']:.4f}"],
+            ['Std Dev', f"{summary['rm3_std_correlation']:.4f}",
              f"{summary['meqe_std_correlation']:.4f}", ''],
-            ['Queries Evaluated', str(summary['num_queries']), '', ''],
-            ['T-statistic', f"{summary['t_statistic']:.4f}", '', ''],
-            ['P-value', f"{summary['t_p_value']:.6f}", '', ''],
+            ['', '', '', ''],
+            ['Statistical Test', 'Value', '', ''],
+            ['t-statistic', f"{summary['t_statistic']:.4f}", '', ''],
+            ['p-value', f"{summary['t_p_value']:.4f}", '', ''],
             ['Significant?', 'Yes' if summary['significant_improvement'] else 'No', '', ''],
-            ['Queries Improved', str(summary['queries_improved']), '', ''],
-            ['Queries Degraded', str(summary['queries_degraded']), '', '']
+            ['', '', '', ''],
+            ['Query Analysis', 'Count', '', ''],
+            ['Total Queries', f"{summary['num_queries']}", '', ''],
+            ['Improved', f"{summary['queries_improved']}", '', ''],
+            ['Degraded', f"{summary['queries_degraded']}", '', ''],
+            ['Unchanged', f"{summary['queries_unchanged']}", '', '']
         ]
 
-        table = ax6.table(cellText=table_data[1:], colLabels=table_data[0],
-                          cellLoc='center', loc='center')
+        table = ax4.table(cellText=table_data, cellLoc='center', loc='center',
+                          colWidths=[0.3, 0.2, 0.2, 0.2])
         table.auto_set_font_size(False)
-        table.set_fontsize(9)
-        table.scale(1, 1.5)
-        ax6.set_title('Summary Statistics')
+        table.set_fontsize(10)
+        table.scale(1, 2)
+
+        # Style the header row
+        for i in range(len(table_data[0])):
+            table[(0, i)].set_facecolor('#E6E6FA')
+            table[(0, i)].set_text_props(weight='bold')
+
+        # Style section headers
+        for row_idx in [5, 10]:
+            for col_idx in range(len(table_data[0])):
+                table[(row_idx, col_idx)].set_facecolor('#F0F0F0')
+                table[(row_idx, col_idx)].set_text_props(weight='bold')
+
+        ax4.set_title('Summary Statistics', fontweight='bold', pad=20)
+
+        plt.tight_layout()
 
         # Save the plot
         plot_path = self.output_dir / 'intrinsic_evaluation_results.png'
-        plt.tight_layout()
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.close()
 
-        # Create additional detailed plot
-        self._create_detailed_analysis_plot(results)
+        logger.info(f"Visualization saved to: {plot_path}")
 
-        logger.info(f"Visualizations saved to: {plot_path}")
+        # Create additional detailed plots
+        self._create_detailed_plots(results)
 
-    def _create_detailed_analysis_plot(self, results: Dict[str, Any]) -> None:
+    def _create_detailed_plots(self, results: Dict[str, Any]) -> None:
         """Create additional detailed analysis plots."""
+        logger.info("Creating detailed analysis plots...")
+
+        # 1. Query-level improvement analysis
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle('Detailed Intrinsic Evaluation Analysis', fontsize=14, fontweight='bold')
+        fig.suptitle('Detailed Query-Level Analysis', fontsize=16, fontweight='bold')
 
-        query_results = results['per_query_results']
-
-        # 1. Distribution of baseline utility ranges
+        # Query performance scatter with improvement coloring
         ax1 = axes[0, 0]
-        utility_ranges = [res['baseline_utility_range'] for res in query_results.values()]
-        ax1.hist(utility_ranges, bins=15, alpha=0.7, color='blue', edgecolor='black')
-        ax1.set_xlabel('Utility Range per Query')
-        ax1.set_ylabel('Number of Queries')
-        ax1.set_title('Distribution of Term Utility Ranges')
+        rm3_corr = np.array(results['raw_correlations']['rm3'])
+        meqe_corr = np.array(results['raw_correlations']['meqe'])
+        improvements = meqe_corr - rm3_corr
+
+        scatter = ax1.scatter(rm3_corr, meqe_corr, c=improvements, cmap='RdYlGn', alpha=0.7, s=60)
+        ax1.plot([min(rm3_corr), max(rm3_corr)], [min(rm3_corr), max(rm3_corr)], 'k--', alpha=0.5)
+        ax1.set_xlabel('RM3 Correlation')
+        ax1.set_ylabel('MEQE Correlation')
+        ax1.set_title('Query Performance with Improvement Coloring')
         ax1.grid(True, alpha=0.3)
 
-        # 2. Correlation difference vs utility range
+        # Add colorbar
+        cbar = plt.colorbar(scatter, ax=ax1)
+        cbar.set_label('MEQE - RM3 Correlation')
+
+        # Distribution of improvements by quartiles
         ax2 = axes[0, 1]
-        corr_diffs = [res['meqe_correlation'] - res['rm3_correlation'] for res in query_results.values()]
-        ax2.scatter(utility_ranges, corr_diffs, alpha=0.6)
-        ax2.axhline(y=0, color='red', linestyle='--', alpha=0.5)
-        ax2.set_xlabel('Utility Range')
-        ax2.set_ylabel('Correlation Difference (MEQE - RM3)')
-        ax2.set_title('Improvement vs Utility Variance')
+        quartiles = np.percentile(rm3_corr, [25, 50, 75])
+        q1_mask = rm3_corr <= quartiles[0]
+        q2_mask = (rm3_corr > quartiles[0]) & (rm3_corr <= quartiles[1])
+        q3_mask = (rm3_corr > quartiles[1]) & (rm3_corr <= quartiles[2])
+        q4_mask = rm3_corr > quartiles[2]
+
+        quartile_improvements = [
+            improvements[q1_mask],
+            improvements[q2_mask],
+            improvements[q3_mask],
+            improvements[q4_mask]
+        ]
+
+        ax2.boxplot(quartile_improvements, labels=['Q1', 'Q2', 'Q3', 'Q4'])
+        ax2.axhline(y=0, color='red', linestyle='--', alpha=0.7)
+        ax2.set_xlabel('RM3 Performance Quartile')
+        ax2.set_ylabel('Correlation Improvement')
+        ax2.set_title('Improvement by RM3 Performance Quartile')
         ax2.grid(True, alpha=0.3)
 
-        # 3. P-value distribution
+        # Correlation vs number of terms
         ax3 = axes[1, 0]
-        rm3_p_values = [res['rm3_p_value'] for res in query_results.values()]
-        meqe_p_values = [res['meqe_p_value'] for res in query_results.values()]
+        per_query = results['per_query_results']
+        num_terms = [per_query[qid]['num_terms'] for qid in per_query.keys()]
+        meqe_correlations = [per_query[qid]['meqe_correlation'] for qid in per_query.keys()]
 
-        ax3.hist([rm3_p_values, meqe_p_values], bins=15, alpha=0.7,
-                 label=['RM3', 'MEQE'], color=['blue', 'green'])
-        ax3.axvline(x=0.05, color='red', linestyle='--', alpha=0.7, label='p=0.05')
-        ax3.set_xlabel('P-value')
-        ax3.set_ylabel('Number of Queries')
-        ax3.set_title('Distribution of Correlation P-values')
-        ax3.legend()
+        ax3.scatter(num_terms, meqe_correlations, alpha=0.6, s=50)
+        ax3.set_xlabel('Number of Terms')
+        ax3.set_ylabel('MEQE Correlation')
+        ax3.set_title('Correlation vs Number of Terms')
         ax3.grid(True, alpha=0.3)
 
-        # 4. Weight range comparison
+        # Improvement vs utility range
         ax4 = axes[1, 1]
-        rm3_ranges = [res['rm3_weight_range'] for res in query_results.values()]
-        meqe_ranges = [res['meqe_weight_range'] for res in query_results.values()]
+        utility_ranges = [per_query[qid]['utility_range'] for qid in per_query.keys()]
+        query_improvements = [per_query[qid]['meqe_correlation'] - per_query[qid]['rm3_correlation']
+                              for qid in per_query.keys()]
 
-        ax4.scatter(rm3_ranges, meqe_ranges, alpha=0.6)
-        min_range = min(min(rm3_ranges), min(meqe_ranges))
-        max_range = max(max(rm3_ranges), max(meqe_ranges))
-        ax4.plot([min_range, max_range], [min_range, max_range], 'r--', alpha=0.5)
-        ax4.set_xlabel('RM3 Weight Range')
-        ax4.set_ylabel('MEQE Weight Range')
-        ax4.set_title('Weight Range Comparison')
+        ax4.scatter(utility_ranges, query_improvements, alpha=0.6, s=50)
+        ax4.axhline(y=0, color='red', linestyle='--', alpha=0.7)
+        ax4.set_xlabel('Utility Score Range')
+        ax4.set_ylabel('Correlation Improvement')
+        ax4.set_title('Improvement vs Utility Score Diversity')
         ax4.grid(True, alpha=0.3)
 
-        plot_path = self.output_dir / 'detailed_intrinsic_analysis.png'
         plt.tight_layout()
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+
+        # Save detailed plots
+        detailed_plot_path = self.output_dir / 'intrinsic_evaluation_detailed.png'
+        plt.savefig(detailed_plot_path, dpi=300, bbox_inches='tight')
         plt.close()
+
+        logger.info(f"Detailed analysis plots saved to: {detailed_plot_path}")
 
     def run_evaluation(self,
                        model_checkpoint_path: str,
                        model_config: Dict[str, Any],
-                       use_run_difference: bool = True,
-                       filter_queries: set = None) -> Dict[str, Any]:
+                       metric: str = "recall.1000") -> Dict[str, Any]:
         """
-        Run the complete optimized intrinsic evaluation.
+        Run the complete intrinsic evaluation pipeline.
 
         Args:
             model_checkpoint_path: Path to trained MEQE model checkpoint
-            model_config: Configuration dict for creating the model
-            use_run_difference: If True, use run difference method; if False, use individual term method
+            model_config: Configuration for model creation
+            metric: Evaluation metric to use (default: recall.1000)
 
         Returns:
             Complete evaluation results
         """
-        logger.info("Starting optimized intrinsic evaluation...")
+        logger.info("Starting intrinsic evaluation pipeline...")
 
-        # Load features
-        with TimedOperation(logger, "Loading features"):
-            features = self.load_features()
+        with TimedOperation("Complete Intrinsic Evaluation"):
+            # Step 1: Load all data
+            with TimedOperation("Loading features"):
+                features = self.load_features()
 
-            # Filter to specific queries if specified
-            if filter_queries:
-                features = {qid: data for qid, data in features.items() if qid in filter_queries}
-                logger.info(f"Filtered features to {len(features)} queries")
+            with TimedOperation("Loading baseline scores"):
+                baseline_scores = self.load_eval_scores(self.baseline_eval_file, metric)
 
-        # Calculate recall scores from existing run files
-        with TimedOperation(logger, "Calculating baseline recall scores"):
-            baseline_recalls = self.calculate_recall_scores(self.baseline_run_file, filter_queries)
+            with TimedOperation("Loading expanded scores"):
+                expanded_scores = self.load_eval_scores(self.expanded_eval_file, metric)
 
-        with TimedOperation(logger, "Calculating expanded recall scores"):
-            expanded_recalls = self.calculate_recall_scores(self.expanded_run_file, filter_queries)
+            # Step 2: Calculate term utilities (ground truth)
+            with TimedOperation("Calculating term utilities"):
+                utility_scores = self.calculate_utility_from_score_difference(
+                    features, baseline_scores, expanded_scores
+                )
 
-        # Calculate term utilities
-        with TimedOperation(logger, "Calculating term utility scores"):
-            if use_run_difference:
-                utility_scores = self.calculate_utility_from_run_difference(
-                    features, baseline_recalls, expanded_recalls)
+            if not utility_scores:
+                logger.error("No utility scores calculated - cannot proceed")
+                return {'error': 'No utility scores calculated'}
+
+            # Step 3: Get MEQE model weights
+            with TimedOperation("Evaluating MEQE model"):
+                meqe_weights = self.evaluate_meqe_model(
+                    features, model_checkpoint_path, model_config
+                )
+
+            # Step 4: Calculate rank correlations
+            with TimedOperation("Calculating rank correlations"):
+                correlation_results = self.calculate_rank_correlations(
+                    utility_scores, features, meqe_weights
+                )
+
+            # Step 5: Create visualizations
+            with TimedOperation("Creating visualizations"):
+                self.create_visualizations(correlation_results)
+
+            # Step 6: Save detailed results
+            with TimedOperation("Saving results"):
+                results_file = self.output_dir / 'intrinsic_evaluation_results.json'
+                save_json(correlation_results, results_file)
+                logger.info(f"Detailed results saved to: {results_file}")
+
+                # Save summary report
+                self._save_summary_report(correlation_results)
+
+        return correlation_results
+
+    def _save_summary_report(self, results: Dict[str, Any]) -> None:
+        """Save a human-readable summary report."""
+        report_path = self.output_dir / 'intrinsic_evaluation_summary.txt'
+
+        with open(report_path, 'w') as f:
+            f.write("=" * 60 + "\n")
+            f.write("INTRINSIC EVALUATION SUMMARY REPORT\n")
+            f.write("Term Re-weighting Quality via Rank Correlation\n")
+            f.write("=" * 60 + "\n\n")
+
+            if 'error' in results:
+                f.write(f"ERROR: {results['error']}\n")
+                f.write(f"Debug Info: {results.get('debug_info', 'N/A')}\n")
+                return
+
+            summary = results['summary']
+
+            f.write("RESEARCH QUESTION:\n")
+            f.write("Is the ranking of expansion terms produced by MEQE's hybrid weights\n")
+            f.write("more correlated with the terms' actual retrieval utility than the\n")
+            f.write("original ranking from RM3?\n\n")
+
+            f.write("METHODOLOGY:\n")
+            f.write("- Ground truth utility: Change in Recall@1000 when adding each term\n")
+            f.write("- Comparison: Spearman rank correlation between utility and weights\n")
+            f.write("- Statistical test: Paired t-test on per-query correlations\n\n")
+
+            f.write("RESULTS:\n")
+            f.write(f"- Queries analyzed: {summary['num_queries']}\n")
+            f.write(
+                f"- RM3 mean correlation: {summary['rm3_mean_correlation']:.4f} ± {summary['rm3_std_correlation']:.4f}\n")
+            f.write(
+                f"- MEQE mean correlation: {summary['meqe_mean_correlation']:.4f} ± {summary['meqe_std_correlation']:.4f}\n")
+            f.write(f"- Improvement: {summary['correlation_difference']:.4f}\n")
+            f.write(f"- t-statistic: {summary['t_statistic']:.4f}\n")
+            f.write(f"- p-value: {summary['t_p_value']:.4f}\n")
+            f.write(f"- Statistically significant: {'Yes' if summary['significant_improvement'] else 'No'}\n\n")
+
+            f.write("QUERY-LEVEL BREAKDOWN:\n")
+            f.write(
+                f"- Queries improved: {summary['queries_improved']} ({summary['queries_improved'] / summary['num_queries'] * 100:.1f}%)\n")
+            f.write(
+                f"- Queries degraded: {summary['queries_degraded']} ({summary['queries_degraded'] / summary['num_queries'] * 100:.1f}%)\n")
+            f.write(
+                f"- Queries unchanged: {summary['queries_unchanged']} ({summary['queries_unchanged'] / summary['num_queries'] * 100:.1f}%)\n\n")
+
+            f.write("INTERPRETATION:\n")
+            if summary['significant_improvement']:
+                f.write("✅ MEQE's hybrid weights produce term rankings that are significantly\n")
+                f.write("   better aligned with actual retrieval utility than RM3 weights.\n")
+                f.write("   This validates the effectiveness of the learned re-weighting scheme.\n")
+            elif summary['correlation_difference'] > 0:
+                f.write("⚠️  MEQE shows improvement over RM3 but the difference is not\n")
+                f.write("   statistically significant. More data or refinement may be needed.\n")
             else:
-                utility_scores = self.calculate_individual_term_utilities(
-                    features, baseline_recalls)
+                f.write("❌ MEQE does not show improvement over RM3 in term ranking quality.\n")
+                f.write("   The model may need further training or architectural changes.\n")
 
-        # Evaluate MEQE model
-        with TimedOperation(logger, "Evaluating MEQE model"):
-            meqe_weights = self.evaluate_meqe_model(features, model_checkpoint_path, model_config)
+            f.write("\n" + "=" * 60 + "\n")
 
-        # Calculate correlations
-        with TimedOperation(logger, "Calculating rank correlations"):
-            correlation_results = self.calculate_rank_correlations(utility_scores, features, meqe_weights)
-
-        # Create visualizations
-        with TimedOperation(logger, "Creating visualizations"):
-            self.create_visualizations(correlation_results)
-
-        # Save intermediate results
-        save_json(utility_scores, self.output_dir / 'utility_scores.json')
-        save_json(meqe_weights, self.output_dir / 'meqe_weights.json')
-        save_json(correlation_results, self.output_dir / 'correlation_results.json')
-
-        # Create final summary
-        final_results = {
-            'experiment_config': {
-                'features_file': str(self.features_file),
-                'baseline_run_file': str(self.baseline_run_file),
-                'expanded_run_file': str(self.expanded_run_file),
-                'qrels_file': str(self.qrels_file),
-                'model_checkpoint': model_checkpoint_path,
-                'use_run_difference_method': use_run_difference,
-                'filtered_to_queries': len(filter_queries) if filter_queries else None,
-                'total_queries_processed': len(features)
-            },
-            'correlation_analysis': correlation_results,
-            'data_files': {
-                'utility_scores': str(self.output_dir / 'utility_scores.json'),
-                'meqe_weights': str(self.output_dir / 'meqe_weights.json'),
-                'main_visualization': str(self.output_dir / 'intrinsic_evaluation_results.png'),
-                'detailed_visualization': str(self.output_dir / 'detailed_intrinsic_analysis.png')
-            }
-        }
-
-        save_json(final_results, self.output_dir / 'final_results.json')
-
-        logger.info("Optimized intrinsic evaluation completed successfully!")
-        return final_results
+        logger.info(f"Summary report saved to: {report_path}")
 
 
 def main():
+    """Main execution function."""
     parser = argparse.ArgumentParser(
-        description="Optimized intrinsic evaluation using existing features and run files",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        description="Run intrinsic evaluation of MEQE term re-weighting quality"
     )
 
     # Required arguments
-    parser.add_argument('--features-file', type=str, required=True,
-                        help='Path to features.jsonl file with RM3 terms and weights')
-    parser.add_argument('--baseline-run', type=str, required=True,
-                        help='Path to BM25 baseline run file')
-    parser.add_argument('--expanded-run', type=str, required=True,
-                        help='Path to expanded run file (e.g., best RM3 alpha)')
-    parser.add_argument('--qrels', type=str, required=True,
-                        help='Path to qrels file')
-    parser.add_argument('--trec-eval', type=str, required=True,
-                        help='Path to trec_eval binary')
-    parser.add_argument('--model-checkpoint', type=str, required=True,
-                        help='Path to trained MEQE model checkpoint')
-    parser.add_argument('--output-dir', type=str, required=True,
-                        help='Output directory for results')
+    parser.add_argument(
+        "--features-file",
+        type=str,
+        required=True,
+        help="Path to features.jsonl file containing term features"
+    )
+    parser.add_argument(
+        "--baseline-eval-file",
+        type=str,
+        required=True,
+        help="Path to baseline per-query evaluation file (trec_eval format)"
+    )
+    parser.add_argument(
+        "--expanded-eval-file",
+        type=str,
+        required=True,
+        help="Path to expanded per-query evaluation file (trec_eval format)"
+    )
+    parser.add_argument(
+        "--model-checkpoint",
+        type=str,
+        required=True,
+        help="Path to trained MEQE model checkpoint"
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        required=True,
+        help="Output directory for results and visualizations"
+    )
 
     # Model configuration arguments (should match training)
-    parser.add_argument('--model-name', type=str, default='all-MiniLM-L6-v2',
-                        help='Model name used in training')
-    parser.add_argument('--max-expansion-terms', type=int, default=15,
-                        help='Maximum expansion terms (should match training)')
-    parser.add_argument('--hidden-dim', type=int, default=128,
-                        help='Hidden dimension (should match training)')
-    parser.add_argument('--dropout', type=float, default=0.1,
-                        help='Dropout rate (should match training)')
-    parser.add_argument('--scoring-method', type=str, default='neural',
-                        choices=['neural', 'bilinear', 'cosine'],
-                        help='Scoring method (should match training)')
-    parser.add_argument('--force-hf', action='store_true',
-                        help='Force HuggingFace transformers (should match training)')
-    parser.add_argument('--pooling-strategy', type=str, default='cls',
-                        choices=['cls', 'mean', 'max'],
-                        help='Pooling strategy for HF models (should match training)')
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default="all-MiniLM-L6-v2",
+        help="Model name used in training"
+    )
+    parser.add_argument(
+        "--max-expansion_terms",
+        type=int,
+        default=15,
+        help="Maximum expansion terms (should match training)"
+    )
+    parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=128,
+        help="Hidden dimension (should match training)"
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.1,
+        help="Dropout rate (should match training)"
+    )
+    parser.add_argument(
+        "--scoring-method",
+        type=str,
+        default="neural",
+        choices=['neural', 'bilinear', 'cosine'],
+        help="Scoring method (should match training)"
+    )
+    parser.add_argument(
+        "--force-hf",
+        action="store_true",
+        help="Force HuggingFace transformers (should match training)"
+    )
+    parser.add_argument(
+        "--pooling-strategy",
+        type=str,
+        default="cls",
+        choices=['cls', 'mean', 'max'],
+        help="Pooling strategy for HF models (should match training)"
+    )
 
-    # Experimental parameters
-    parser.add_argument('--utility-method', type=str, default='run_difference',
-                        choices=['run_difference', 'individual_terms'],
-                        help='Method to calculate term utilities')
-    parser.add_argument('--folds-file', type=str,
-                        help='Path to folds.json (for filtering to specific fold)')
-    parser.add_argument('--fold-id', type=str,
-                        help='Fold ID to filter to (e.g., "0")')
-    parser.add_argument('--fold-split', type=str, choices=['training', 'testing'],
-                        help='Which fold split to use')
-    parser.add_argument('--log-level', type=str, default='INFO',
-                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
+    # Evaluation options
+    parser.add_argument(
+        "--metric",
+        type=str,
+        default="ndcg_cut_20",
+        help="Evaluation metric to use (default: recall.1000)"
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging"
+    )
 
     args = parser.parse_args()
 
     # Setup logging
-    output_dir = ensure_dir(args.output_dir)
-    logger = setup_experiment_logging("optimized_intrinsic_evaluation", args.log_level,
-                                      str(output_dir / 'intrinsic_evaluation.log'))
-    log_experiment_info(logger, **vars(args))
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    setup_experiment_logging(
+        experiment_name="intrinsic_evaluation",
+        output_dir=Path(args.output_dir),
+        log_level=log_level
+    )
 
-    try:
-        # Create model configuration
-        model_config = {
-            'model_name': args.model_name,
-            'max_expansion_terms': args.max_expansion_terms,
+    # Log experiment info
+    log_experiment_info({
+        'experiment_type': 'intrinsic_evaluation',
+        'features_file': args.features_file,
+        'baseline_eval_file': args.baseline_eval_file,
+        'expanded_eval_file': args.expanded_eval_file,
+        'model_checkpoint': args.model_checkpoint,
+        'metric': args.metric,
+        'model_config': {
+            'model_type': args.model_type,
             'hidden_dim': args.hidden_dim,
-            'dropout': args.dropout,
-            #'scoring_method': args.scoring_method,
-            # 'force_hf': args.force_hf,
-            # 'pooling_strategy': args.pooling_strategy,
-            'device': 'cpu'  # Use CPU for evaluation to avoid GPU memory issues
+            'num_layers': args.num_layers,
+            'dropout': args.dropout
         }
+    })
 
-        # Load fold queries if specified
-        fold_queries = None
-        if args.folds_file and args.fold_id and args.fold_split:
-            with open(args.folds_file, 'r') as f:
-                folds = json.load(f)
-            fold_queries = set(folds[args.fold_id][args.fold_split])
-            logger.info(f"Filtering to fold {args.fold_id} {args.fold_split}: {len(fold_queries)} queries")
+    # Create model configuration
+    model_config = {
+        'model_name': args.model_name,
+        'max_expansion_terms': args.max_expansion_terms,
+        'hidden_dim': args.hidden_dim,
+        'dropout': args.dropout,
+        'scoring_method': args.scoring_method,
+        'force_hf': args.force_hf,
+        'pooling_strategy': args.pooling_strategy,
+        'device': 'cpu'  # Use CPU for evaluation to avoid GPU memory issues
+    }
 
-        # Initialize evaluator
-        evaluator = OptimizedIntrinsicEvaluator(
-            features_file=args.features_file,
-            baseline_run_file=args.baseline_run,
-            expanded_run_file=args.expanded_run,
-            qrels_file=args.qrels,
-            trec_eval_path=args.trec_eval,
-            output_dir=output_dir
+    # Initialize evaluator
+    evaluator = CleanIntrinsicEvaluator(
+        features_file=args.features_file,
+        baseline_eval_file=args.baseline_eval_file,
+        expanded_eval_file=args.expanded_eval_file,
+        output_dir=Path(args.output_dir)
+    )
+
+    # Run evaluation
+    try:
+        results = evaluator.run_evaluation(
+            model_checkpoint_path=args.model_checkpoint,
+            model_config=model_config,
+            metric=args.metric
         )
 
-        # Run evaluation
-        use_run_difference = (args.utility_method == 'run_difference')
-        results = evaluator.run_evaluation(args.model_checkpoint, model_config, use_run_difference, fold_queries)
-
-        # Print summary
-        summary = results['correlation_analysis']['summary']
-        print("\n" + "=" * 70)
-        print("OPTIMIZED INTRINSIC EVALUATION RESULTS")
-        print("=" * 70)
-        print(f"Method: {'Run difference' if use_run_difference else 'Individual terms'}")
-        print(f"Queries evaluated: {summary['num_queries']}")
-        print(f"")
-        print(f"RM3 Statistics:")
-        print(f"  Mean correlation: {summary['rm3_mean_correlation']:.4f} ± {summary['rm3_std_correlation']:.4f}")
-        print(f"  Median correlation: {summary['rm3_median_correlation']:.4f}")
-        print(f"")
-        print(f"MEQE Statistics:")
-        print(f"  Mean correlation: {summary['meqe_mean_correlation']:.4f} ± {summary['meqe_std_correlation']:.4f}")
-        print(f"  Median correlation: {summary['meqe_median_correlation']:.4f}")
-        print(f"")
-        print(f"Comparison:")
-        print(f"  Improvement: {summary['correlation_difference']:.4f}")
-        print(f"  T-statistic: {summary['t_statistic']:.4f}")
-        print(f"  P-value: {summary['t_p_value']:.6f}")
-        print(f"  Significant improvement: {'Yes' if summary['significant_improvement'] else 'No'}")
-        print(f"")
-        print(f"Query-level Changes:")
-        print(f"  Queries improved: {summary['queries_improved']}")
-        print(f"  Queries degraded: {summary['queries_degraded']}")
-        print(f"  Queries unchanged: {summary['queries_unchanged']}")
-        print(f"")
-        print("=" * 70)
-        print(f"Detailed results saved to: {output_dir}")
-        print(f"Main visualization: {output_dir}/intrinsic_evaluation_results.png")
-        print(f"Detailed analysis: {output_dir}/detailed_intrinsic_analysis.png")
-        print("=" * 70)
-
-        # Create a simple text report
-        report_file = output_dir / 'evaluation_report.txt'
-        with open(report_file, 'w') as f:
-            f.write("INTRINSIC EVALUATION REPORT\n")
-            f.write("=" * 50 + "\n\n")
-            f.write(f"Evaluation Method: {'Run difference' if use_run_difference else 'Individual terms'}\n")
-            f.write(f"Total Queries Evaluated: {summary['num_queries']}\n\n")
-
-            f.write("CORRELATION ANALYSIS:\n")
-            f.write(
-                f"RM3 Mean Correlation: {summary['rm3_mean_correlation']:.4f} (±{summary['rm3_std_correlation']:.4f})\n")
-            f.write(
-                f"MEQE Mean Correlation: {summary['meqe_mean_correlation']:.4f} (±{summary['meqe_std_correlation']:.4f})\n")
-            f.write(f"Improvement: {summary['correlation_difference']:.4f}\n\n")
-
-            f.write("STATISTICAL SIGNIFICANCE:\n")
-            f.write(f"T-statistic: {summary['t_statistic']:.4f}\n")
-            f.write(f"P-value: {summary['t_p_value']:.6f}\n")
-            f.write(f"Significant at α=0.05: {'Yes' if summary['significant_improvement'] else 'No'}\n\n")
-
-            f.write("QUERY-LEVEL ANALYSIS:\n")
-            f.write(f"Queries with improved correlation: {summary['queries_improved']}\n")
-            f.write(f"Queries with degraded correlation: {summary['queries_degraded']}\n")
-            f.write(f"Queries with unchanged correlation: {summary['queries_unchanged']}\n\n")
-
-            improvement_rate = summary['queries_improved'] / summary['num_queries'] * 100
-            f.write(f"Improvement rate: {improvement_rate:.1f}%\n")
-
-        print(f"Text report saved to: {report_file}")
+        if 'error' not in results:
+            logger.info("Intrinsic evaluation completed successfully!")
+            summary = results['summary']
+            logger.info(f"Final result: MEQE correlation = {summary['meqe_mean_correlation']:.4f}, "
+                        f"RM3 correlation = {summary['rm3_mean_correlation']:.4f}, "
+                        f"improvement = {summary['correlation_difference']:.4f}")
+        else:
+            logger.error(f"Evaluation failed: {results['error']}")
+            return 1
 
     except Exception as e:
-        logger.error(f"Optimized intrinsic evaluation failed: {e}", exc_info=True)
-        sys.exit(1)
+        logger.error(f"Evaluation failed with exception: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return 1
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
