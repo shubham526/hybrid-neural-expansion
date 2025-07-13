@@ -307,8 +307,8 @@ def main():
         ensure_model_device_consistency(reranker, device)
 
         # Log learned weights
-        alpha, beta = reranker.get_learned_weights()
-        logger.info(f"Loaded model weights: α={alpha:.4f}, β={beta:.4f}")
+        alpha, beta, expansion_weight= reranker.get_learned_weights()
+        logger.info(f"Loaded weights: α={alpha:.3f}, β={beta:.3f}, λ={expansion_weight:.3f}")
 
         # Set model to evaluation mode
         reranker.eval()

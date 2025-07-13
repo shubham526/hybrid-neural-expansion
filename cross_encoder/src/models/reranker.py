@@ -84,6 +84,7 @@ class ConfigurableNeuralReranker(nn.Module):
         # Learnable parameters (always needed for both methods)
         self.alpha = nn.Parameter(torch.tensor(0.5, device=self.device, dtype=torch.float32))
         self.beta = nn.Parameter(torch.tensor(0.5, device=self.device, dtype=torch.float32))
+        # self.expansion_weight = torch.tensor(0.3, device=self.device, dtype=torch.float32)
         self.expansion_weight = nn.Parameter(torch.tensor(0.0, device=self.device, dtype=torch.float32))
 
         # Register parameters explicitly

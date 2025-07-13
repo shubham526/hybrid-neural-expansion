@@ -75,7 +75,7 @@ class DenseModelHandler:
         self.model_type = 'huggingface'
         logger.info(f"Loaded as HuggingFace transformer model")
 
-    def encode_texts(self, texts: List[str], batch_size: int = 32, show_progress: bool = True) -> np.ndarray:
+    def encode_texts(self, texts: List[str], batch_size: int = 32, show_progress: bool = False) -> np.ndarray:
         """Encode a list of texts into dense vectors."""
         if not texts:
             return np.array([]).reshape(0, -1)
@@ -90,7 +90,7 @@ class DenseModelHandler:
         embeddings = self.model.encode(
             texts,
             batch_size=batch_size,
-            show_progress_bar=show_progress,
+            show_progress_bar=False,
             convert_to_numpy=True
         )
         return embeddings

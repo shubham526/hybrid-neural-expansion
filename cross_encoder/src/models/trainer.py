@@ -437,6 +437,93 @@ class EvaluationAwareTrainer:
         return total_loss / num_batches if num_batches > 0 else 0.0
 
         # FIX: Add method to synchronize all devices
+
+    # Add this method inside the EvaluationAwareTrainer class in cross_encoder/src/models/trainer.py
+
+    # Add this method to the EvaluationAwareTrainer class in cross_encoder/src/models/trainer.py
+
+    def train_epoch_pairwise(self, dataset: Dataset, epoch: int) -> float:
+        """Train for one epoch using pairwise ranking loss."""
+        self._synchronize_model_devices()
+        self.model.train()
+
+        from cross_encoder.src.utils.data_utils import pairwise_collate_fn
+
+        dataloader = DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            collate_fn=pairwise_collate_fn
+        )
+        total_loss = 0.0
+        num_batches = 0
+
+        logger.info(f"Dataset size: {len(dataset)}, Batch size: {self.batch_size}, Expected batches: {len(dataloader)}")
+
+        # Track weights if they exist
+        if hasattr(self.model, 'get_learned_weights'):
+            epoch_start_alpha, epoch_start_beta, epoch_start_lambda = self.model.get_learned_weights()
+            logger.info(
+                f"Epoch {epoch} starting weights: α={epoch_start_alpha:.6f}, β={epoch_start_beta:.6f}, λ={epoch_start_lambda:.6f}")
+
+        for step, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch} (Pairwise)")):
+            global_step = epoch * len(dataloader) + step
+
+            try:
+                self.optimizer.zero_grad()
+
+                # Get batch data
+                query_texts = batch['query_text']
+                expansion_features_list = batch['expansion_features']
+                positive_docs = batch['positive_doc']
+                negative_docs = batch['negative_doc']
+
+                positive_scores = []
+                negative_scores = []
+
+                for i in range(len(query_texts)):
+                    pos_score = self.model(
+                        query=query_texts[i],
+                        expansion_features=expansion_features_list[i],
+                        document=positive_docs[i]['doc_text']
+                    )
+                    neg_score = self.model(
+                        query=query_texts[i],
+                        expansion_features=expansion_features_list[i],
+                        document=negative_docs[i]['doc_text']
+                    )
+                    positive_scores.append(pos_score)
+                    negative_scores.append(neg_score)
+
+                positive_scores = torch.stack(positive_scores)
+                negative_scores = torch.stack(negative_scores)
+
+                target = torch.ones(positive_scores.size(0), device=self.model.device)
+
+                loss = self.criterion(positive_scores, negative_scores, target)
+                loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+                total_loss += loss.item()
+                num_batches += 1
+
+            except Exception as e:
+                logger.error(f"Error in training batch {global_step}: {e}")
+                continue
+
+        # Epoch summary
+        if hasattr(self.model, 'get_learned_weights'):
+            epoch_end_alpha, epoch_end_beta, epoch_end_lambda = self.model.get_learned_weights()
+            alpha_change = epoch_end_alpha - epoch_start_alpha
+            beta_change = epoch_end_beta - epoch_start_beta
+            lambda_change = epoch_end_lambda - epoch_start_lambda
+
+            logger.info(
+                f"Epoch {epoch} weight changes: Δα={alpha_change:+.6f}, Δβ={beta_change:+.6f}, Δλ={lambda_change:+.6f}")
+
+        return total_loss / num_batches if num_batches > 0 else 0.0
     def _synchronize_model_devices(self):
         """Ensure all model components are on the same device."""
         if not hasattr(self.model, 'alpha') or not hasattr(self.model, 'beta'):
@@ -611,7 +698,10 @@ class EvaluationAwareTrainer:
             logger.info(f"{'='*50}")
 
             # Training
-            train_loss = self.train_epoch_pointwise(train_dataset, epoch + 1)
+            if self.loss_type == 'ranking':  # Or check a training_mode attribute if you pass it
+                train_loss = self.train_epoch_pairwise(train_dataset, epoch + 1)
+            else:
+                train_loss = self.train_epoch_pointwise(train_dataset, epoch + 1)
             history['train_loss'].append(train_loss)
 
             # Track weights
