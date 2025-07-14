@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 from datetime import datetime
 import torch
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,22 @@ def load_features_file(filepath: Union[str, Path]) -> Dict[str, Dict]:
         logger.info(f"Loading JSON features file: {filepath}")
         return load_json(filepath)
 
+def convert_numpy_types(obj):
+    """
+    A default function for json.dump to handle special numpy types.
+    """
+    if isinstance(obj, (np.integer, np.int_, np.intc, np.intp, np.int8,
+                        np.int16, np.int32, np.int64, np.uint8,
+                        np.uint16, np.uint32, np.uint64)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float16, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, (np.ndarray,)):
+        return obj.tolist()
+    elif isinstance(obj, np.bool_): # <-- This is the key line for your error
+        return bool(obj)
+    return obj
+
 
 def save_json(data: Any, filepath: Union[str, Path], indent: int = 2,
               compress: bool = False) -> None:
@@ -109,11 +126,12 @@ def save_json(data: Any, filepath: Union[str, Path], indent: int = 2,
     if compress:
         filepath = filepath.with_suffix(filepath.suffix + '.gz')
         with gzip.open(filepath, 'wt', encoding='utf-8') as f:
-            json.dump(data, f, indent=indent, ensure_ascii=False)
+            # Add the 'default' argument here
+            json.dump(data, f, indent=indent, ensure_ascii=False, default=convert_numpy_types)
     else:
         with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=indent, ensure_ascii=False)
-
+            # And also add it here
+            json.dump(data, f, indent=indent, ensure_ascii=False, default=convert_numpy_types)
     logger.info(f"Saved JSON to: {filepath}")
 
 

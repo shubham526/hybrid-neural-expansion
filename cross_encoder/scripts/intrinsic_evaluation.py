@@ -19,6 +19,7 @@ import json
 from scipy.stats import spearmanr, ttest_rel
 import matplotlib.pyplot as plt
 import seaborn as sns
+import tempfile
 
 # Add project root to path
 project_root = Path(__file__).resolve().parent.parent.parent
@@ -27,6 +28,10 @@ sys.path.insert(0, str(project_root))
 from cross_encoder.src.models.reranker import create_neural_reranker
 from cross_encoder.src.utils.file_utils import ensure_dir, save_json
 from cross_encoder.src.utils.logging_utils import setup_experiment_logging, log_experiment_info, TimedOperation
+
+# Import ir_measures for metric calculation
+import ir_measures
+from ir_measures import *
 
 logger = logging.getLogger(__name__)
 
@@ -39,26 +44,30 @@ class CleanIntrinsicEvaluator:
     def __init__(self,
                  features_file: str,
                  baseline_eval_file: str,
-                 expanded_eval_file: str,
-                 output_dir: Path):
+                 output_dir: Path,
+                 qrels_file: str = None,
+                 index_path: str = None):
         """
         Initialize the evaluator.
 
         Args:
             features_file: Path to features.jsonl file
             baseline_eval_file: Path to baseline per-query eval file
-            expanded_eval_file: Path to expanded per-query eval file
             output_dir: Output directory for results
+            qrels_file: Path to qrels file (for individual term retrieval)
+            index_path: Path to Lucene index (for individual term retrieval)
         """
         self.features_file = Path(features_file)
         self.baseline_eval_file = Path(baseline_eval_file)
-        self.expanded_eval_file = Path(expanded_eval_file)
         self.output_dir = ensure_dir(output_dir)
+        self.qrels_file = qrels_file
+        self.index_path = index_path
 
         logger.info(f"CleanIntrinsicEvaluator initialized:")
         logger.info(f"  Features file: {features_file}")
         logger.info(f"  Baseline eval: {baseline_eval_file}")
-        logger.info(f"  Expanded eval: {expanded_eval_file}")
+        logger.info(f"  QRels file: {qrels_file}")
+        logger.info(f"  Index path: {index_path}")
 
     def load_features(self) -> Dict[str, Dict]:
         """Load features from JSONL file."""
@@ -76,117 +85,339 @@ class CleanIntrinsicEvaluator:
 
     def load_eval_scores(self, eval_file: Path, metric: str = "recall.1000") -> Dict[str, float]:
         """
-        Load per-query evaluation scores from trec_eval output file.
+        Load per-query evaluation scores using ir_measures.
 
-        Expected format: metric query_id score
-        e.g., "recall.1000 301 0.4567"
+        Supports both trec_eval format files and TREC run files.
+        If it's a run file, we'll need qrels to calculate the metric.
         """
         logger.info(f"Loading {metric} scores from: {eval_file}")
 
-        scores = {}
-        with open(eval_file, 'r') as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) >= 3 and parts[0] == metric:
-                    query_id = parts[1]
-                    score = float(parts[2])
-                    scores[query_id] = score
+        # Check if this is a pre-computed trec_eval results file or a run file
+        try:
+            # Try to read as trec_eval results first (format: metric query_id score)
+            scores = {}
+            with open(eval_file, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 3 and parts[0] == metric:
+                        query_id = parts[1]
+                        score = float(parts[2])
+                        scores[query_id] = score
+                    else:
+                        logger.error(f"Metric {parts[0]} in file does not match metric {metric} provided. Exiting.")
+                        sys.exit(1)
 
-        logger.info(f"Loaded {metric} scores for {len(scores)} queries")
+            if scores:
+                logger.info(f"Loaded {metric} scores for {len(scores)} queries from trec_eval format")
+                # Show sample scores
+                sample_queries = list(scores.keys())[:3]
+                logger.info(f"Sample {metric} scores:")
+                for qid in sample_queries:
+                    logger.info(f"  Query {qid}: {scores[qid]:.4f}")
+                return scores
+        except:
+            pass
 
-        # Show sample scores
-        if scores:
-            sample_queries = list(scores.keys())[:3]
-            logger.info(f"Sample {metric} scores:")
-            for qid in sample_queries:
-                logger.info(f"  Query {qid}: {scores[qid]:.4f}")
+        # If not trec_eval format, treat as run file and compute metric using ir_measures
+        logger.info(f"Treating {eval_file} as TREC run file, computing {metric} using ir_measures")
 
-        return scores
+        if not self.qrels_file:
+            logger.error(f"Need qrels file to compute {metric} from run file {eval_file}")
+            return {}
 
-    def calculate_utility_from_score_difference(self,
-                                                features: Dict[str, Dict],
-                                                baseline_scores: Dict[str, float],
-                                                expanded_scores: Dict[str, float]) -> Dict[str, Dict[str, float]]:
+        try:
+            # Load qrels and run using ir_measures
+            qrels = ir_measures.read_trec_qrels(self.qrels_file)
+            run = ir_measures.read_trec_run(str(eval_file))
+
+            # Parse the metric - convert from trec_eval format to ir_measures format
+            if metric == "recall.1000":
+                ir_metric = R@1000
+            elif metric.startswith("recall."):
+                cutoff = int(metric.split(".")[1])
+                ir_metric = ir_measures.parse_measure(f"R@{cutoff}")
+            elif metric.startswith("ndcg_cut_"):
+                cutoff = int(metric.split("_")[-1])
+                ir_metric = ir_measures.parse_measure(f"nDCG@{cutoff}")
+            elif metric == "map":
+                ir_metric = AP
+            else:
+                # Try to parse as ir_measures format
+                ir_metric = ir_measures.parse_measure(metric)
+
+            # Calculate per-query results
+            scores = {}
+            for result in ir_measures.iter_calc([ir_metric], qrels, run):
+                scores[result.query_id] = result.value
+
+            logger.info(f"Computed {metric} for {len(scores)} queries using ir_measures")
+
+            # Show sample scores
+            if scores:
+                sample_queries = list(scores.keys())[:3]
+                logger.info(f"Sample {metric} scores:")
+                for qid in sample_queries:
+                    logger.info(f"  Query {qid}: {scores[qid]:.4f}")
+
+            return scores
+
+        except Exception as e:
+            logger.error(f"Failed to compute {metric} using ir_measures: {e}")
+            return {}
+
+        return {}
+
+    def calculate_utility_from_individual_term_retrieval(self,
+                                                         features: Dict[str, Dict],
+                                                         baseline_scores: Dict[str, float],
+                                                         top_k_retrieval: int = 1000) -> Dict[str, Dict[str, float]]:
         """
-        Calculate term utilities by distributing the score improvement from expanded vs baseline.
+        Calculate TRUE term utilities by running individual retrieval for each expansion term.
+        This implements the correct experimental methodology using ir_measures.
         """
-        logger.info("Calculating term utilities from score difference...")
-        logger.info(f"Input data sizes:")
-        logger.info(f"  Features: {len(features)} queries")
-        logger.info(f"  Baseline scores: {len(baseline_scores)} queries")
-        logger.info(f"  Expanded scores: {len(expanded_scores)} queries")
+        if not self.index_path or not self.qrels_file:
+            logger.error("Individual term retrieval requires both index_path and qrels_file")
+            return {}
 
-        # Check query ID overlap
+        logger.info("Calculating individual term utilities via separate retrievals...")
+        logger.info("This is the CORRECT implementation of the experimental plan")
+
+        # Initialize Lucene components
+        from cross_encoder.src.utils.lucene_utils import get_lucene_classes
+
+        lucene_classes = get_lucene_classes()
+        FSDirectory = lucene_classes['FSDirectory']
+        Paths = lucene_classes['Path']
+        DirectoryReader = lucene_classes['DirectoryReader']
+        IndexSearcher = lucene_classes['IndexSearcher']
+        BM25Similarity = lucene_classes['BM25Similarity']
+        BooleanQueryBuilder = lucene_classes['BooleanQueryBuilder']
+        TermQuery = lucene_classes['TermQuery']
+        Term = lucene_classes['Term']
+        Occur = lucene_classes['BooleanClauseOccur']
+        BoostQuery = lucene_classes['BoostQuery']
+
+        # Open index
+        directory = FSDirectory.open(Paths.get(self.index_path))
+        reader = DirectoryReader.open(directory)
+        reader_context = reader.getContext()
+        searcher = IndexSearcher(reader_context)
+        searcher.setSimilarity(BM25Similarity())
+
+        logger.info(f"Lucene index loaded: {self.index_path}")
+
+        # Load qrels using ir_measures
+        qrels = ir_measures.read_trec_qrels(self.qrels_file)
+        logger.info(f"Loaded qrels using ir_measures from: {self.qrels_file}")
+
+        # Check query overlap
         feature_queries = set(features.keys())
         baseline_queries = set(baseline_scores.keys())
-        expanded_queries = set(expanded_scores.keys())
+        qrels_queries = set(qrel.query_id for qrel in qrels)
 
-        all_overlap = feature_queries & baseline_queries & expanded_queries
+        all_overlap = feature_queries & baseline_queries & qrels_queries
         logger.info(f"Common queries across all datasets: {len(all_overlap)}")
 
         if len(all_overlap) == 0:
-            logger.error("No queries found in all three datasets!")
-            logger.error(f"Sample feature queries: {list(feature_queries)[:5]}")
-            logger.error(f"Sample baseline queries: {list(baseline_queries)[:5]}")
-            logger.error(f"Sample expanded queries: {list(expanded_queries)[:5]}")
+            logger.error("No queries found in all datasets!")
             return {}
 
         term_utilities = {}
         queries_processed = 0
-        queries_with_improvement = 0
-        total_improvements = []
 
-        for query_id, query_data in features.items():
-            if query_id not in baseline_scores or query_id not in expanded_scores:
-                continue
+        # Create temporary files for ir_measures evaluation
+        import tempfile
+        import os
 
-            queries_processed += 1
-            baseline_score = baseline_scores[query_id]
-            expanded_score = expanded_scores[query_id]
-            total_improvement = expanded_score - baseline_score
-            total_improvements.append(total_improvement)
+        try:
+            for query_id, query_data in tqdm(features.items(), desc="Processing queries"):
+                if query_id not in baseline_scores or query_id not in qrels_queries:
+                    continue
 
-            # Debug for first few queries
-            if queries_processed <= 3:
-                logger.info(f"Query {query_id}:")
-                logger.info(f"  Baseline score: {baseline_score:.4f}")
-                logger.info(f"  Expanded score: {expanded_score:.4f}")
-                logger.info(f"  Total improvement: {total_improvement:.4f}")
+                queries_processed += 1
+                baseline_score = baseline_scores[query_id]
+                query_text = query_data['query_text']
+                term_features = query_data['term_features']
 
-            if total_improvement > 0:
-                queries_with_improvement += 1
+                # Debug for first few queries
+                if queries_processed <= 3:
+                    logger.info(f"Query {query_id}: '{query_text}'")
+                    logger.info(f"  Baseline nDCG@20: {baseline_score:.4f}")
+                    logger.info(f"  Processing {len(term_features)} expansion terms")
 
-            term_features = query_data['term_features']
+                query_utilities = {}
 
-            # Calculate total RM3 weight for normalization
-            total_rm3_weight = sum(term_data['rm_weight'] for term_data in term_features.values())
+                # Process each expansion term individually
+                for term_idx, (term, term_data) in enumerate(term_features.items()):
+                    # Get the original (unstemmed) term for query expansion
+                    original_term = term_data.get('original_term', term)
 
-            if total_rm3_weight == 0:
-                logger.warning(f"Zero total RM3 weight for query {query_id}")
-                continue
+                    try:
+                        # Build Lucene query for expanded query
+                        builder = BooleanQueryBuilder()
 
-            # Distribute improvement proportionally to RM3 weights
-            query_utilities = {}
-            for term, term_data in term_features.items():
-                rm_weight = term_data['rm_weight']
-                # Each term gets improvement proportional to its RM3 weight
-                term_utility = (rm_weight / total_rm3_weight) * total_improvement
-                query_utilities[term] = term_utility
+                        # Add original query terms
+                        original_terms = self._tokenize_query_lucene(query_text, searcher)
+                        for orig_term in original_terms:
+                            term_query = TermQuery(Term("contents", orig_term))
+                            builder.add(term_query, Occur.SHOULD)
 
-            term_utilities[query_id] = query_utilities
+                        # Add expansion term with weight 0.5
+                        expansion_term_query = TermQuery(Term("contents", original_term.lower()))
+                        boosted_expansion = BoostQuery(expansion_term_query, 0.5)
+                        builder.add(boosted_expansion, Occur.SHOULD)
 
-        # Summary statistics
-        if total_improvements:
-            mean_improvement = np.mean(total_improvements)
-            positive_improvements = sum(1 for x in total_improvements if x > 0)
-            logger.info(f"Utility calculation summary:")
-            logger.info(f"  Queries processed: {queries_processed}")
-            logger.info(f"  Mean improvement: {mean_improvement:.4f}")
-            logger.info(
-                f"  Queries with positive improvement: {positive_improvements} ({positive_improvements / len(total_improvements) * 100:.1f}%)")
-            logger.info(f"  Final utility scores: {len(term_utilities)} queries")
+                        final_query = builder.build()
+
+                        # Execute search
+                        top_docs = searcher.search(final_query, top_k_retrieval)
+                        # if len(top_docs.scoreDocs) == 0:
+                        #     logger.warning(
+                        #         f"    [DIAGNOSTIC] Term '{original_term}' resulted in 0 documents from Lucene.")
+                        # else:
+                        #     logger.warning(
+                        #         f"    [DIAGNOSTIC] Term '{original_term}' resulted in '{len(top_docs.scoreDocs)}' documents from Lucene.")
+
+
+                        # Create temporary run file for this expanded query
+                        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.run') as temp_run:
+                            for rank, score_doc in enumerate(top_docs.scoreDocs, 1):
+                                doc_id = reader.storedFields().document(score_doc.doc).get("id")
+                                if doc_id:
+                                    temp_run.write(f'{query_id} Q0 {doc_id} {rank} {score_doc.score:.6f} expanded\n')
+                                    # print(f'{query_id} Q0 {doc_id} {rank} {score_doc.score:.6f} expanded\n')
+                            temp_run_path = temp_run.name
+
+
+                        # In your calculate_utility_from_individual_term_retrieval function...
+
+                        try:
+                            # Load the run using ir_measures and immediately convert to a list
+                            # This prevents the generator from being exhausted.
+                            expanded_run = list(ir_measures.read_trec_run(temp_run_path))
+
+                            # Default the recall to 0.0. This handles empty run files gracefully.
+                            expanded_recall = 0.0
+
+                            # Only proceed if the Lucene search actually returned results
+                            if expanded_run:
+                                # Use iter_calc to get a dictionary of {query_id: score}
+                                # This is the correct way to get per-query results.
+                                per_query_scores = {m.query_id: m.value for m in
+                                                    ir_measures.iter_calc([nDCG@20], qrels, expanded_run)}
+
+                                # Get the recall for the specific query we are currently processing
+                                expanded_recall = per_query_scores.get(query_id, 0.0)
+
+                            # Calculate the final utility for the term
+                            term_utility = expanded_recall - baseline_score
+                            query_utilities[term] = term_utility
+
+                            # Debug for first query, first few terms
+                            if queries_processed == 1 and term_idx < 3:
+                                logger.info(
+                                    f"    Term '{original_term}' -> nDCG@20: {expanded_recall:.4f}, utility: {term_utility:.4f}")
+
+                        finally:
+                            # Clean up temporary file
+                            os.unlink(temp_run_path)
+
+                    except Exception as e:
+                        logger.warning(f"Error processing term '{original_term}' for query {query_id}: {e}")
+                        query_utilities[term] = 0.0
+
+                term_utilities[query_id] = query_utilities
+
+                # Log progress for first few queries
+                if queries_processed <= 3:
+                    avg_utility = np.mean(list(query_utilities.values())) if query_utilities else 0.0
+                    logger.info(f"  Average term utility: {avg_utility:.4f}")
+
+        finally:
+            # Clean up Lucene resources
+            reader.close()
+            directory.close()
+
+        logger.info(f"Individual term utility calculation complete:")
+        logger.info(f"  Queries processed: {queries_processed}")
+        logger.info(f"  Final utility scores: {len(term_utilities)} queries")
 
         return term_utilities
+
+    def _load_qrels_for_evaluation(self) -> Dict[str, Dict[str, int]]:
+        """Load qrels using ir_measures (preferred) with fallback to manual parsing."""
+        if not self.qrels_file:
+            logger.warning("No qrels file provided - cannot calculate individual term utilities")
+            return {}
+
+        qrels_file = Path(self.qrels_file)
+
+        try:
+            # Try using ir_measures first (preferred method)
+            logger.info(f"Loading qrels using ir_measures from: {qrels_file}")
+            qrels_ir = ir_measures.read_trec_qrels(str(qrels_file))
+
+            # Convert to the expected dictionary format
+            qrels = {}
+            for qrel in qrels_ir:
+                if qrel.query_id not in qrels:
+                    qrels[qrel.query_id] = {}
+                qrels[qrel.query_id][qrel.doc_id] = qrel.relevance
+
+            logger.info(f"Loaded qrels for {len(qrels)} queries using ir_measures")
+            return qrels
+
+        except Exception as e:
+            logger.warning(f"ir_measures loading failed ({e}), trying manual parsing...")
+
+            # Fallback to manual parsing
+            qrels = {}
+            try:
+                with open(qrels_file, 'r') as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) >= 4:
+                            query_id = parts[0]
+                            doc_id = parts[2]
+                            relevance = int(parts[3])
+
+                            if query_id not in qrels:
+                                qrels[query_id] = {}
+                            qrels[query_id][doc_id] = relevance
+
+                logger.info(f"Loaded qrels for {len(qrels)} queries using manual parsing")
+                return qrels
+
+            except Exception as file_error:
+                logger.error(f"Could not load qrels from {qrels_file}: {file_error}")
+                return {}
+
+    def _tokenize_query_lucene(self, query_text: str, searcher) -> List[str]:
+        """Tokenize query using Lucene's analyzer."""
+        from cross_encoder.src.utils.lucene_utils import get_lucene_classes
+
+        lucene_classes = get_lucene_classes()
+        EnglishAnalyzer = lucene_classes['EnglishAnalyzer']
+        CharTermAttribute = lucene_classes['CharTermAttribute']
+
+        analyzer = EnglishAnalyzer()
+        tokens = []
+
+        try:
+            token_stream = analyzer.tokenStream("contents", query_text)
+            char_term_attr = token_stream.addAttribute(CharTermAttribute)
+            token_stream.reset()
+
+            while token_stream.incrementToken():
+                tokens.append(char_term_attr.toString())
+
+            token_stream.close()
+        except Exception as e:
+            logger.warning(f"Error tokenizing query '{query_text}': {e}")
+            # Fallback to simple splitting
+            tokens = query_text.lower().split()
+
+        return tokens
 
     def evaluate_meqe_model(self,
                             features: Dict[str, Dict],
@@ -243,6 +474,7 @@ class CleanIntrinsicEvaluator:
                                     meqe_weights: Dict[str, Dict[str, float]]) -> Dict[str, Any]:
         """
         Calculate Spearman rank correlations between utility scores and different weighting schemes.
+        This version explicitly handles cases of constant utility to avoid NaN correlations.
         """
         logger.info("Calculating rank correlations...")
         logger.info(f"Input data sizes:")
@@ -250,163 +482,99 @@ class CleanIntrinsicEvaluator:
         logger.info(f"  Features: {len(features)} queries")
         logger.info(f"  MEQE weights: {len(meqe_weights)} queries")
 
-        rm3_correlations = []
-        meqe_correlations = []
-        query_results = {}
-
-        # Check what queries we have in each dataset
-        utility_queries = set(utility_scores.keys())
-        feature_queries = set(features.keys())
-        meqe_queries = set(meqe_weights.keys())
-
-        common_queries = utility_queries & feature_queries & meqe_queries
+        # --- Find common queries across all data sources ---
+        common_queries = set(utility_scores.keys()) & set(features.keys()) & set(meqe_weights.keys())
         logger.info(f"Common queries across all datasets: {len(common_queries)}")
 
-        if len(common_queries) == 0:
+        if not common_queries:
             logger.error("No common queries found!")
-            return {
-                'error': 'No common queries found',
-                'debug_info': {
-                    'utility_queries': len(utility_queries),
-                    'feature_queries': len(feature_queries),
-                    'meqe_queries': len(meqe_queries)
-                },
-                'raw_correlations': {'rm3': [], 'meqe': []}
-            }
+            return {'error': 'No common queries to process.'}
 
-        queries_processed = 0
+        query_results = {}
         queries_with_sufficient_terms = 0
 
-        for query_id in common_queries:
-            queries_processed += 1
+        # --- Process each query individually ---
+        for query_id in sorted(list(common_queries)):  # Sorting for consistent order
+            utility_dict = utility_scores.get(query_id, {})
+            term_features = features.get(query_id, {}).get('term_features', {})
+            meqe_dict = meqe_weights.get(query_id, {})
 
-            # Get data for this query
-            utility_dict = utility_scores[query_id]
-            term_features = features[query_id]['term_features']
-            meqe_dict = meqe_weights[query_id]
+            # Find common terms for this specific query
+            common_terms = set(utility_dict.keys()) & set(term_features.keys()) & set(meqe_dict.keys())
 
-            # Ensure we have the same terms in all dictionaries
-            utility_terms = set(utility_dict.keys())
-            feature_terms = set(term_features.keys())
-            meqe_terms = set(meqe_dict.keys())
-
-            common_terms = utility_terms & feature_terms & meqe_terms
-
-            if len(common_terms) < 3:  # Need at least 3 points for correlation
-                logger.debug(f"Skipping query {query_id} - insufficient common terms ({len(common_terms)})")
+            if len(common_terms) < 3:  # Spearman correlation needs at least a few data points
                 continue
 
             queries_with_sufficient_terms += 1
 
-            # Create aligned lists
-            utility_values = []
-            rm3_values = []
-            meqe_values = []
+            # --- Create aligned lists of values for correlation ---
+            utility_values = np.array([utility_dict[term] for term in common_terms], dtype=float)
+            rm3_values = np.array([term_features[term]['rm_weight'] for term in common_terms], dtype=float)
+            meqe_values = np.array([meqe_dict[term] for term in common_terms], dtype=float)
 
-            for term in common_terms:
-                utility_values.append(utility_dict[term])
-                rm3_values.append(term_features[term]['rm_weight'])
-                meqe_values.append(meqe_dict[term])
-
-            # Debug for first query
-            if queries_with_sufficient_terms == 1:
-                logger.info(f"First valid query {query_id} sample data:")
-                logger.info(f"  Sample utility values: {[f'{x:.4f}' for x in utility_values[:3]]}")
-                logger.info(f"  Sample RM3 values: {[f'{x:.4f}' for x in rm3_values[:3]]}")
-                logger.info(f"  Sample MEQE values: {[f'{x:.4f}' for x in meqe_values[:3]]}")
-
-            # Calculate correlations
-            try:
+            # --- Key Fix: Check for constant utility values before calculating ---
+            # The correlation is undefined if one of the inputs has no variance.
+            if np.all(utility_values == utility_values[0]):
+                logger.warning(
+                    f"Query {query_id}: Skipped. All utility scores are constant ({utility_values[0]:.4f}), so correlation is undefined.")
+                # Record as NaN to indicate it couldn't be calculated
+                rho_rm3, p_rm3 = np.nan, np.nan
+                rho_meqe, p_meqe = np.nan, np.nan
+            else:
+                # Proceed with calculation only if utility varies
                 rho_rm3, p_rm3 = spearmanr(utility_values, rm3_values)
                 rho_meqe, p_meqe = spearmanr(utility_values, meqe_values)
 
-                # Handle NaN values (can happen with constant arrays)
-                if not np.isnan(rho_rm3):
-                    rm3_correlations.append(rho_rm3)
-                if not np.isnan(rho_meqe):
-                    meqe_correlations.append(rho_meqe)
-
-                query_results[query_id] = {
-                    'rm3_correlation': rho_rm3 if not np.isnan(rho_rm3) else 0.0,
-                    'meqe_correlation': rho_meqe if not np.isnan(rho_meqe) else 0.0,
-                    'rm3_p_value': p_rm3 if not np.isnan(rho_rm3) else 1.0,
-                    'meqe_p_value': p_meqe if not np.isnan(rho_meqe) else 1.0,
-                    'num_terms': len(common_terms),
-                    'utility_range': max(utility_values) - min(utility_values) if utility_values else 0,
-                    'rm3_weight_range': max(rm3_values) - min(rm3_values) if rm3_values else 0,
-                    'meqe_weight_range': max(meqe_values) - min(meqe_values) if meqe_values else 0
-                }
-
-                if queries_with_sufficient_terms <= 3:
-                    logger.info(f"Query {query_id} correlations: RM3={rho_rm3:.4f}, MEQE={rho_meqe:.4f}")
-
-            except Exception as e:
-                logger.warning(f"Error calculating correlation for query {query_id}: {e}")
-                continue
-
-        logger.info(f"Processed {queries_processed} queries")
-        logger.info(f"Queries with sufficient terms: {queries_with_sufficient_terms}")
-        logger.info(f"Valid RM3 correlations: {len(rm3_correlations)}")
-        logger.info(f"Valid MEQE correlations: {len(meqe_correlations)}")
-
-        # Ensure we have paired data for t-test
-        valid_pairs = []
-        for query_id, results in query_results.items():
-            if not np.isnan(results['rm3_correlation']) and not np.isnan(results['meqe_correlation']):
-                valid_pairs.append((results['rm3_correlation'], results['meqe_correlation']))
-
-        if len(valid_pairs) < 2:
-            logger.error(f"Insufficient valid correlation pairs for statistical testing: {len(valid_pairs)}")
-            return {
-                'error': 'Insufficient valid correlation pairs',
-                'debug_info': {
-                    'queries_processed': queries_processed,
-                    'queries_with_sufficient_terms': queries_with_sufficient_terms,
-                    'valid_pairs': len(valid_pairs)
-                },
-                'per_query_results': query_results,
-                'raw_correlations': {'rm3': [], 'meqe': []}
+            query_results[query_id] = {
+                'rm3_correlation': rho_rm3,
+                'meqe_correlation': rho_meqe,
+                'rm3_p_value': p_rm3,
+                'meqe_p_value': p_meqe,
+                'num_terms': len(common_terms),
+                'utility_variance': np.var(utility_values)
             }
 
+        # --- Aggregate results and perform statistical tests ---
+        logger.info(f"Queries with sufficient terms: {queries_with_sufficient_terms}")
+
+        # Create paired lists for T-test, excluding any queries where correlation could not be calculated.
+        valid_pairs = [(res['rm3_correlation'], res['meqe_correlation']) for res in query_results.values()
+                       if not np.isnan(res['rm3_correlation']) and not np.isnan(res['meqe_correlation'])]
+
+        logger.info(f"Valid correlation pairs for comparison: {len(valid_pairs)}")
+
+        if len(valid_pairs) < 2:
+            logger.error("Insufficient valid data for a paired t-test.")
+            return {'summary': {'error': 'Insufficient valid data'}, 'per_query_results': query_results}
+
+        # Unzip the pairs for testing
         paired_rm3, paired_meqe = zip(*valid_pairs)
-        paired_rm3 = np.array(paired_rm3)
-        paired_meqe = np.array(paired_meqe)
 
         # Perform paired t-test
         t_stat, t_p_value = ttest_rel(paired_meqe, paired_rm3)
 
-        results = {
+        final_results = {
             'summary': {
                 'rm3_mean_correlation': np.mean(paired_rm3),
-                'rm3_std_correlation': np.std(paired_rm3),
-                'rm3_median_correlation': np.median(paired_rm3),
                 'meqe_mean_correlation': np.mean(paired_meqe),
-                'meqe_std_correlation': np.std(paired_meqe),
-                'meqe_median_correlation': np.median(paired_meqe),
                 'correlation_difference': np.mean(paired_meqe) - np.mean(paired_rm3),
-                'num_queries': len(valid_pairs),
+                'num_queries_analyzed': len(valid_pairs),
                 't_statistic': t_stat,
                 't_p_value': t_p_value,
                 'significant_improvement': t_p_value < 0.05 and np.mean(paired_meqe) > np.mean(paired_rm3),
-                'queries_improved': np.sum(paired_meqe > paired_rm3),
-                'queries_degraded': np.sum(paired_meqe < paired_rm3),
-                'queries_unchanged': np.sum(paired_meqe == paired_rm3)
+                'queries_improved': int(np.sum(np.array(paired_meqe) > np.array(paired_rm3))),
             },
-            'per_query_results': query_results,
-            'raw_correlations': {
-                'rm3': paired_rm3.tolist(),
-                'meqe': paired_meqe.tolist()
-            }
+            'per_query_results': query_results
         }
 
-        logger.info(f"Correlation analysis complete:")
-        logger.info(f"  RM3 mean correlation: {results['summary']['rm3_mean_correlation']:.4f}")
-        logger.info(f"  MEQE mean correlation: {results['summary']['meqe_mean_correlation']:.4f}")
-        logger.info(f"  Difference: {results['summary']['correlation_difference']:.4f}")
-        logger.info(f"  Queries improved: {results['summary']['queries_improved']}")
-        logger.info(f"  Significant improvement: {results['summary']['significant_improvement']}")
+        logger.info("Correlation analysis complete:")
+        logger.info(f"  RM3 mean correlation: {final_results['summary']['rm3_mean_correlation']:.4f}")
+        logger.info(f"  MEQE mean correlation: {final_results['summary']['meqe_mean_correlation']:.4f}")
+        logger.info(f"  Queries improved: {final_results['summary']['queries_improved']} / {len(valid_pairs)}")
+        logger.info(f"  P-value: {final_results['summary']['t_p_value']:.4f}")
+        logger.info(f"  Significant improvement: {final_results['summary']['significant_improvement']}")
 
-        return results
+        return final_results
 
     def create_visualizations(self, results: Dict[str, Any]) -> None:
         """Create visualizations for the correlation results."""
@@ -635,7 +803,8 @@ class CleanIntrinsicEvaluator:
     def run_evaluation(self,
                        model_checkpoint_path: str,
                        model_config: Dict[str, Any],
-                       metric: str = "recall.1000") -> Dict[str, Any]:
+                       metric: str = "recall.1000",
+                       use_individual_retrieval: bool = False) -> Dict[str, Any]:
         """
         Run the complete intrinsic evaluation pipeline.
 
@@ -643,51 +812,58 @@ class CleanIntrinsicEvaluator:
             model_checkpoint_path: Path to trained MEQE model checkpoint
             model_config: Configuration for model creation
             metric: Evaluation metric to use (default: recall.1000)
+            use_individual_retrieval: If True, use individual term retrieval method
 
         Returns:
             Complete evaluation results
         """
         logger.info("Starting intrinsic evaluation pipeline...")
 
-        with TimedOperation("Complete Intrinsic Evaluation"):
+        with TimedOperation(logger, "Complete Intrinsic Evaluation"):
             # Step 1: Load all data
-            with TimedOperation("Loading features"):
+            with TimedOperation(logger, "Loading features"):
                 features = self.load_features()
 
-            with TimedOperation("Loading baseline scores"):
+            with TimedOperation(logger,"Loading baseline scores"):
                 baseline_scores = self.load_eval_scores(self.baseline_eval_file, metric)
 
-            with TimedOperation("Loading expanded scores"):
-                expanded_scores = self.load_eval_scores(self.expanded_eval_file, metric)
-
             # Step 2: Calculate term utilities (ground truth)
-            with TimedOperation("Calculating term utilities"):
-                utility_scores = self.calculate_utility_from_score_difference(
-                    features, baseline_scores, expanded_scores
-                )
+            if use_individual_retrieval and self.index_path and self.qrels_file:
+                with TimedOperation(logger,"Calculating individual term utilities"):
+                    utility_scores = self.calculate_utility_from_individual_term_retrieval(
+                        features, baseline_scores
+                    )
+            else:
+                with TimedOperation(logger,"Loading expanded scores"):
+                    expanded_scores = self.load_eval_scores(self.expanded_eval_file, metric)
+
+                with TimedOperation(logger,"Calculating term utilities from score difference"):
+                    utility_scores = self.calculate_utility_from_score_difference(
+                        features, baseline_scores, expanded_scores
+                    )
 
             if not utility_scores:
                 logger.error("No utility scores calculated - cannot proceed")
                 return {'error': 'No utility scores calculated'}
 
             # Step 3: Get MEQE model weights
-            with TimedOperation("Evaluating MEQE model"):
+            with TimedOperation(logger,"Evaluating MEQE model"):
                 meqe_weights = self.evaluate_meqe_model(
                     features, model_checkpoint_path, model_config
                 )
 
             # Step 4: Calculate rank correlations
-            with TimedOperation("Calculating rank correlations"):
+            with TimedOperation(logger,"Calculating rank correlations"):
                 correlation_results = self.calculate_rank_correlations(
                     utility_scores, features, meqe_weights
                 )
 
             # Step 5: Create visualizations
-            with TimedOperation("Creating visualizations"):
+            with TimedOperation(logger,"Creating visualizations"):
                 self.create_visualizations(correlation_results)
 
             # Step 6: Save detailed results
-            with TimedOperation("Saving results"):
+            with TimedOperation(logger,"Saving results"):
                 results_file = self.output_dir / 'intrinsic_evaluation_results.json'
                 save_json(correlation_results, results_file)
                 logger.info(f"Detailed results saved to: {results_file}")
@@ -780,12 +956,6 @@ def main():
         help="Path to baseline per-query evaluation file (trec_eval format)"
     )
     parser.add_argument(
-        "--expanded-eval-file",
-        type=str,
-        required=True,
-        help="Path to expanded per-query evaluation file (trec_eval format)"
-    )
-    parser.add_argument(
         "--model-checkpoint",
         type=str,
         required=True,
@@ -798,6 +968,28 @@ def main():
         help="Output directory for results and visualizations"
     )
 
+    # Optional arguments for individual retrieval
+    parser.add_argument(
+        "--index-path",
+        type=str,
+        help="Path to Lucene index (required for individual term retrieval)"
+    )
+    parser.add_argument(
+        "--qrels-file",
+        type=str,
+        help="Path to qrels file (required for individual term retrieval)"
+    )
+    parser.add_argument(
+        "--use-individual-retrieval",
+        action="store_true",
+        help="Use individual term retrieval method (requires index_path and qrels_file)"
+    )
+    parser.add_argument(
+        "--lucene-path",
+        type=str,
+        help="Path to Lucene JAR files (required if using individual retrieval)"
+    )
+
     # Model configuration arguments (should match training)
     parser.add_argument(
         "--model-name",
@@ -806,7 +998,7 @@ def main():
         help="Model name used in training"
     )
     parser.add_argument(
-        "--max-expansion_terms",
+        "--max-expansion-terms",
         type=int,
         default=15,
         help="Maximum expansion terms (should match training)"
@@ -847,40 +1039,59 @@ def main():
     parser.add_argument(
         "--metric",
         type=str,
-        default="ndcg_cut_20",
+        default="recall.1000",
         help="Evaluation metric to use (default: recall.1000)"
     )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug logging"
-    )
+    parser.add_argument('--log-level', type=str, default='INFO')
 
     args = parser.parse_args()
 
-    # Setup logging
-    log_level = logging.DEBUG if args.debug else logging.INFO
     setup_experiment_logging(
         experiment_name="intrinsic_evaluation",
-        output_dir=Path(args.output_dir),
-        log_level=log_level
+        log_level=args.log_level,
+        log_file=str(Path(args.output_dir) / 'intrinsic_evaluation.log')
+    )
+
+    # Get logger instance
+    logger = logging.getLogger(__name__)
+
+    # Initialize Lucene if using individual retrieval
+    if args.use_individual_retrieval:
+        if not args.lucene_path:
+            logger.error("--lucene_path is required when using individual retrieval")
+            sys.exit(1)
+        if not args.index_path or not args.qrels_file:
+            logger.error("--index_path and --qrels_file are required when using individual retrieval")
+            sys.exit(1)
+
+        from cross_encoder.src.utils.lucene_utils import initialize_lucene
+        if not initialize_lucene(args.lucene_path):
+            logger.error("Failed to initialize Lucene")
+            sys.exit(1)
+
+
+    logger = setup_experiment_logging(
+        experiment_name="intrinsic_evaluation",
+        log_level=args.log_level,
+        log_file=str(Path(args.output_dir) / 'intrinsic_evaluation.log')
     )
 
     # Log experiment info
-    log_experiment_info({
-        'experiment_type': 'intrinsic_evaluation',
-        'features_file': args.features_file,
-        'baseline_eval_file': args.baseline_eval_file,
-        'expanded_eval_file': args.expanded_eval_file,
-        'model_checkpoint': args.model_checkpoint,
-        'metric': args.metric,
-        'model_config': {
-            'model_type': args.model_type,
-            'hidden_dim': args.hidden_dim,
-            'num_layers': args.num_layers,
-            'dropout': args.dropout
-        }
-    })
+    log_experiment_info(
+        logger,
+        experiment_type='intrinsic_evaluation',
+        features_file=args.features_file,
+        baseline_eval_file=args.baseline_eval_file,
+        model_checkpoint=args.model_checkpoint,
+        metric=args.metric,
+        use_individual_retrieval=args.use_individual_retrieval,
+        index_path=args.index_path,
+        qrels_file=args.qrels_file,
+        model_name=args.model_name,
+        hidden_dim=args.hidden_dim,
+        dropout=args.dropout,
+        scoring_method=args.scoring_method
+    )
 
     # Create model configuration
     model_config = {
@@ -898,8 +1109,9 @@ def main():
     evaluator = CleanIntrinsicEvaluator(
         features_file=args.features_file,
         baseline_eval_file=args.baseline_eval_file,
-        expanded_eval_file=args.expanded_eval_file,
-        output_dir=Path(args.output_dir)
+        output_dir=Path(args.output_dir),
+        qrels_file=args.qrels_file,
+        index_path=args.index_path
     )
 
     # Run evaluation
@@ -907,7 +1119,8 @@ def main():
         results = evaluator.run_evaluation(
             model_checkpoint_path=args.model_checkpoint,
             model_config=model_config,
-            metric=args.metric
+            metric=args.metric,
+            use_individual_retrieval=args.use_individual_retrieval
         )
 
         if 'error' not in results:
