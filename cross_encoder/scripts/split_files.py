@@ -67,7 +67,6 @@ def main():
     # Input files
     parser.add_argument('--features-file', type=str, required=True, help='Input features.jsonl file')
     parser.add_argument('--baseline-eval', type=str, required=True, help='Baseline per-query eval file')
-    parser.add_argument('--expanded-eval', type=str, required=True, help='Expanded per-query eval file')
     parser.add_argument('--qrels-file', type=str, required=True, help='Qrels file')
     
     # Optional parameters
@@ -91,10 +90,7 @@ def main():
     # Filter baseline eval file
     output_baseline = output_dir / f"fold_{args.fold_id}_{args.split}_baseline_eval.txt"
     baseline_count = filter_trec_eval_file(args.baseline_eval, str(output_baseline), query_ids, args.metric)
-    
-    # Filter expanded eval file
-    output_expanded = output_dir / f"fold_{args.fold_id}_{args.split}_expanded_eval.txt"
-    expanded_count = filter_trec_eval_file(args.expanded_eval, str(output_expanded), query_ids, args.metric)
+
     
     # Filter qrels file
     output_qrels = output_dir / f"fold_{args.fold_id}_{args.split}_qrels.txt"
@@ -118,13 +114,11 @@ def main():
         'files_created': {
             'features': str(output_features),
             'baseline_eval': str(output_baseline),
-            'expanded_eval': str(output_expanded),
             'qrels': str(output_qrels)
         },
         'counts': {
             'features': features_count,
             'baseline_eval': baseline_count,
-            'expanded_eval': expanded_count,
             'qrels': qrels_count
         }
     }
@@ -137,7 +131,6 @@ def main():
     print(f"  Fold {args.fold_id} {args.split}: {len(query_ids)} queries")
     print(f"  Features: {features_count} queries")
     print(f"  Baseline eval: {baseline_count} scores")
-    print(f"  Expanded eval: {expanded_count} scores")
     print(f"  Qrels: {qrels_count} judgments")
     print(f"  Summary saved to: {summary_file}")
     print(f"\nFiles ready for intrinsic evaluation!")

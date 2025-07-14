@@ -171,6 +171,15 @@ class LuceneRM3Scorer:
         for score_doc, doc_weight in zip(score_docs, doc_weights):
             pyserini_doc = self.searcher.storedFields().document(score_doc.doc)
             doc_id = pyserini_doc.get("id") or f"internal_doc_{score_doc.doc}"
+            # print('doc_id:', doc_id)
+            # print("🔍 Inspecting document fields:")
+            # doc_data = {}
+            # # The getFields() method is deprecated, iterating directly is preferred
+            # for field in pyserini_doc:
+            #     doc_data[field.name()] = field.stringValue()
+            # # Use json.dumps for pretty printing the dictionary
+            # print(json.dumps(doc_data, indent=2))
+            # print("-" * 20)
 
             # Use the new helper function to get content
             doc_content = self._extract_content_from_doc(pyserini_doc, doc_id)
