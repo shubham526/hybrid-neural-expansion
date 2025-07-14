@@ -421,8 +421,6 @@ def main():
 
     parser.add_argument('--device', type=str, default=None,
                         help='Device (cuda/cpu)')
-    parser.add_argument('--log-level', type=str, default='INFO')
-
     args = parser.parse_args()
 
     # Setup logging
