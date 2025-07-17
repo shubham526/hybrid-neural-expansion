@@ -23,7 +23,7 @@ project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(project_root))
 import ir_datasets
 
-from cross_encoder.src.models.reranker import create_neural_reranker
+from cross_encoder.src.models.reranker2 import create_neural_reranker
 from cross_encoder.src.models.trainer import EvaluationAwareTrainer
 from cross_encoder.src.utils.file_utils import save_json, ensure_dir
 from cross_encoder.src.utils.logging_utils import setup_experiment_logging, log_experiment_info, TimedOperation
@@ -421,6 +421,8 @@ def main():
 
     parser.add_argument('--device', type=str, default=None,
                         help='Device (cuda/cpu)')
+    parser.add_argument('--log-level', type=str, default='INFO',
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
     args = parser.parse_args()
 
     # Setup logging
@@ -541,9 +543,9 @@ def main():
                 dropout=args.dropout,
                 scoring_method=args.scoring_method,
                 device=args.device,
-                force_hf=args.force_hf,  # NEW parameter
-                pooling_strategy=args.pooling_strategy,  # NEW parameter
-                ablation_mode=args.ablation_mode
+                # force_hf=args.force_hf,  # NEW parameter
+                # pooling_strategy=args.pooling_strategy,  # NEW parameter
+                # ablation_mode=args.ablation_mode
             )
             if torch.cuda.is_available():
                 device = torch.device(f'cuda:{torch.cuda.current_device()}')
