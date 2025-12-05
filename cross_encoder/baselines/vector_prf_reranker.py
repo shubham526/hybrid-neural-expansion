@@ -541,7 +541,7 @@ class VectorPRFReranker:
 def main():
     parser = argparse.ArgumentParser(description="Vector-based PRF Reranker")
     parser.add_argument("--model", required=True,
-                        help="Dense model name (e.g., 'sentence-transformers/all-MiniLM-L6-v2')")
+                        help="Dense model name (e.g., 'v2sentence-transformers/all-MiniLM-L6-')")
     parser.add_argument("--dataset", required=True,
                         help="IR dataset name (e.g., 'msmarco-passage/dev')")
     parser.add_argument("--run", required=True,
