@@ -30,19 +30,42 @@ def load_case_study(json_file):
     """Load the case study JSON file"""
     with open(json_file, 'r') as f:
         data = json.load(f)
-    print(f"✅ Loaded case studies for {len(data)} queries")
-    return data
+
+    # Handle nested structure with individual_analyses
+    if 'individual_analyses' in data:
+        print(f"✅ Loaded case studies for {len(data['individual_analyses'])} queries")
+        return data
+    else:
+        # Direct query mapping
+        skip_keys = ['case_study_config', 'summary', 'metadata']
+        query_count = len([k for k in data.keys() if k not in skip_keys])
+        print(f"✅ Loaded case studies for {query_count} queries")
+        return data
 
 
 def extract_term_data(case_studies):
     """Extract all term data from case studies into a structured format"""
     all_terms = []
 
-    for query_id, study in case_studies.items():
+    # Skip meta keys
+    skip_keys = ['case_study_config', 'summary', 'metadata']
+
+    # Check if individual_analyses exists
+    if 'individual_analyses' in case_studies:
+        queries_to_process = case_studies['individual_analyses']
+    else:
+        queries_to_process = {k: v for k, v in case_studies.items() if k not in skip_keys}
+
+    for query_id, study in queries_to_process.items():
+        if query_id in skip_keys:
+            continue
+
         query_text = study.get('query', 'Unknown')
 
-        # Handle different possible structures
-        if 'terms' in study:
+        # Handle different possible structures for terms
+        if 'term_analysis' in study:
+            terms = study['term_analysis']
+        elif 'terms' in study:
             terms = study['terms']
         elif 'expansion_terms' in study:
             terms = study['expansion_terms']
@@ -50,17 +73,26 @@ def extract_term_data(case_studies):
             continue
 
         for term_data in terms:
-            # Extract scores with fallback handling
+            # Extract scores with comprehensive fallback handling
             term_info = {
                 'query_id': query_id,
                 'query_text': query_text,
-                'term': term_data.get('term', term_data.get('text', 'unknown')),
-                'rm3_score': float(term_data.get('rm3_score', term_data.get('rm3', 0))),
-                'semantic_score': float(
-                    term_data.get('semantic_score', term_data.get('semantic', term_data.get('cosine_similarity', 0)))),
-                'meqe_score': float(
-                    term_data.get('meqe_score', term_data.get('final_weight', term_data.get('hybrid', 0)))),
-                'importance': term_data.get('importance', term_data.get('classification', 'Unknown'))
+                'term': term_data.get('term', term_data.get('text', term_data.get('original_term', 'unknown'))),
+                'rm3_score': float(term_data.get('rm_weight', term_data.get('rm3_score', term_data.get('rm3',
+                                                                                                       term_data.get(
+                                                                                                           'rm_score',
+                                                                                                           0))))),
+                'semantic_score': float(term_data.get('semantic_score', term_data.get('semantic',
+                                                                                      term_data.get('cosine_similarity',
+                                                                                                    term_data.get(
+                                                                                                        'semantic_similarity',
+                                                                                                        0))))),
+                'meqe_score': float(term_data.get('meqe_importance', term_data.get('meqe_score',
+                                                                                   term_data.get('final_weight',
+                                                                                                 term_data.get('hybrid',
+                                                                                                               0))))),
+                'importance': term_data.get('meqe_category',
+                                            term_data.get('importance', term_data.get('classification', 'Unknown')))
             }
 
             # Calculate boost factor
@@ -72,7 +104,16 @@ def extract_term_data(case_studies):
             all_terms.append(term_info)
 
     df = pd.DataFrame(all_terms)
-    print(f"✅ Extracted {len(df)} total expansion terms from {len(case_studies)} queries")
+    if len(df) == 0:
+        print("⚠️  WARNING: No terms extracted. Check JSON structure.")
+        print("Keys in case_studies:", list(case_studies.keys())[:5])
+        if len(case_studies) > 0:
+            first_key = list(case_studies.keys())[0]
+            if first_key not in skip_keys:
+                print(f"Sample structure for key '{first_key}':", list(case_studies[first_key].keys()))
+    else:
+        print(f"✅ Extracted {len(df)} total expansion terms from {len(queries_to_process)} queries")
+
     return df
 
 
