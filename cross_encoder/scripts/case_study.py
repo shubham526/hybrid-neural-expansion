@@ -753,6 +753,10 @@ def main():
                         help='Specific query IDs to analyze')
     parser.add_argument('--query-search', type=str,
                         help='Search for queries containing this text (e.g., "Edison rival")')
+    parser.add_argument('--all', action='store_true',
+                        help='Analyze ALL queries in the features file')
+    parser.add_argument('--max-queries', type=int, default=None,
+                        help='Maximum number of queries to analyze (useful with --all)')
     parser.add_argument('--list-queries', action='store_true',
                         help='List available queries and exit')
 
@@ -776,18 +780,15 @@ def main():
             semantic_model=args.semantic_model
         )
 
-        # List queries if requested
-        if args.list_queries:
-            print("\nAvailable Queries (first 20):")
-            print("=" * 60)
-            queries = analyzer.list_available_queries(20)
-            for query_id, query_text in queries:
-                print(f"{query_id:<10} {query_text}")
-            print(f"\nTotal queries available: {len(analyzer.features_data)}")
-            return
-
         # Run case study
-        if args.query_search:
+        if args.all:
+            # Analyze ALL queries
+            all_query_ids = list(analyzer.features_data.keys())
+            if args.max_queries:
+                all_query_ids = all_query_ids[:args.max_queries]
+            logger.info(f"Analyzing ALL {len(all_query_ids)} queries")
+            results = analyzer.run_case_study(query_ids=all_query_ids)
+        elif args.query_search:
             # Search for queries containing specific text
             results = analyzer.run_case_study(query_text_search=args.query_search)
         elif args.query_ids:
@@ -797,10 +798,6 @@ def main():
             # Default behavior - analyze first few queries
             logger.info("No specific queries provided - analyzing first 3 queries")
             results = analyzer.run_case_study(query_ids=list(analyzer.features_data.keys())[:3])
-
-        if not results or not results.get('individual_analyses'):
-            logger.error("No results generated - check your query specifications")
-            return
 
         # Print summary for the main results
         print("\n" + "=" * 60)
