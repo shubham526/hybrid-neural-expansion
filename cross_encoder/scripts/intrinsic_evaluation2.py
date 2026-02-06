@@ -15,8 +15,6 @@ from typing import Dict, List, Any
 from tqdm import tqdm
 import json
 from scipy.stats import ttest_rel
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 # Add project root to path
 project_root = Path(__file__).resolve().parent.parent.parent
