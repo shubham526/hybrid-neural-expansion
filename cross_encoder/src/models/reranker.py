@@ -84,13 +84,13 @@ class ConfigurableNeuralReranker(nn.Module):
         # Learnable parameters (always needed for both methods)
         self.alpha = nn.Parameter(torch.tensor(0.5, device=self.device, dtype=torch.float32))
         self.beta = nn.Parameter(torch.tensor(0.5, device=self.device, dtype=torch.float32))
-        self.expansion_weight = torch.tensor(0.3, device=self.device, dtype=torch.float32)
-        # self.expansion_weight = nn.Parameter(torch.tensor(0.0, device=self.device, dtype=torch.float32))
+        # self.expansion_weight = torch.tensor(0.3, device=self.device, dtype=torch.float32)
+        self.expansion_weight = nn.Parameter(torch.tensor(0.0, device=self.device, dtype=torch.float32))
 
         # Register parameters explicitly
         self.register_parameter('alpha', self.alpha)
         self.register_parameter('beta', self.beta)
-        # self.register_parameter('expansion_weight', self.expansion_weight)
+        self.register_parameter('expansion_weight', self.expansion_weight)
 
         # Setup scoring layers based on method
         if scoring_method == "neural":
@@ -206,10 +206,15 @@ class ConfigurableNeuralReranker(nn.Module):
         # --- FIX STARTS HERE ---
         # Create a new list of the *original* (unstemmed) words for semantic encoding.
         # We fall back to the stemmed term if 'original_term' is somehow missing.
+        # original_terms_for_encoding = [
+        #     word
+        #     for term in stemmed_expansion_terms
+        #     for word in expansion_features[term].get('original_term', [term])
+        # ]
+        # Get original (unstemmed) terms for semantic encoding
         original_terms_for_encoding = [
-            word
+            expansion_features[term].get('original_term', term)
             for term in stemmed_expansion_terms
-            for word in expansion_features[term].get('original_term', [term])
         ]
         # --- FIX ENDS HERE ---
 

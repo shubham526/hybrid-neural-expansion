@@ -73,15 +73,27 @@ class ExpansionFeatureExtractor:
                 query_text, original_terms_for_similarity
             )
 
-            # Step 3: Combine all features into a final dictionary.
+            # Step 3: Normalize RM3 weights to [0, 1] for comparable scales
+            rm_weights_only = [weight for _, weight in rm_terms]
+            if rm_weights_only:
+                min_rm = min(rm_weights_only)
+                max_rm = max(rm_weights_only)
+                rm_range = max_rm - min_rm if max_rm > min_rm else 1.0
+            else:
+                min_rm, max_rm, rm_range = 0.0, 1.0, 1.0
+
+            # Step 4: Combine all features into a final dictionary with normalized RM weights
             term_features = {}
             for i, (stemmed_term, rm_weight) in enumerate(rm_terms):
                 original_term = original_terms_for_similarity[i]
                 semantic_score = semantic_scores.get(original_term, 0.0)
 
+                # Normalize RM weight to [0, 1]
+                normalized_rm = (rm_weight - min_rm) / rm_range
+
                 term_features[stemmed_term] = {
-                    'rm_weight': float(rm_weight),
-                    'semantic_score': float(semantic_score),
+                    'rm_weight': float(normalized_rm),  # Now in [0, 1]
+                    'semantic_score': float(semantic_score),  # Already in [-1, 1]
                     'original_term': original_term
                 }
 
