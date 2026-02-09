@@ -436,11 +436,6 @@ class EvaluationAwareTrainer:
 
         return total_loss / num_batches if num_batches > 0 else 0.0
 
-        # FIX: Add method to synchronize all devices
-
-    # Add this method inside the EvaluationAwareTrainer class in cross_encoder/src/models/trainer.py
-
-    # Add this method to the EvaluationAwareTrainer class in cross_encoder/src/models/trainer.py
 
     def train_epoch_pairwise(self, dataset: Dataset, epoch: int) -> float:
         """Train for one epoch using pairwise ranking loss."""
